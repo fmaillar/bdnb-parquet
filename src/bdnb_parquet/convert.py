@@ -29,6 +29,7 @@ from .parser import (
     pg_copy_unescape,
     trailing_backslash_count,
 )
+from .resume import build_resume_index, load_resume_catalog, open_indexed_range
 
 SQL_MEMBER = "pgdump/bdnb.sql"
 DEFAULT_SOURCE = Path(
@@ -601,6 +602,230 @@ def build_manifest(output: Path) -> list[dict[str, Any]]:
     return rows
 
 
+
+def convert_indexed(
+    args: argparse.Namespace,
+    *,
+    source: Path,
+    output: Path,
+    rapidgzip: str,
+    identity: dict[str, Any],
+    requested: set[str],
+    references: dict[str, dict[str, Any]],
+    workers: int,
+    gzip_threads: int,
+    max_in_flight: int,
+) -> int:
+    """Convert only incomplete COPY blocks using rapidgzip random access."""
+    resume_root = output / "_resume"
+    index_path = (
+        args.resume_index.expanduser().resolve()
+        if args.resume_index is not None
+        else resume_root / "bdnb-pgdump.gzidx"
+    )
+    catalog_path = (
+        args.resume_catalog.expanduser().resolve()
+        if args.resume_catalog is not None
+        else resume_root / "copy-offsets.json"
+    )
+
+    catalog = None
+    if not args.rebuild_resume_index and index_path.exists():
+        catalog = load_resume_catalog(catalog_path, identity=identity)
+
+    if catalog is None:
+        print(f"resume index: building {index_path}", flush=True)
+        catalog = build_resume_index(
+            source=source,
+            rapidgzip=rapidgzip,
+            index_path=index_path,
+            catalog_path=catalog_path,
+            gzip_threads=gzip_threads,
+        )
+        print(
+            f"resume index: ready ({len(catalog['tables'])} COPY blocks)",
+            flush=True,
+        )
+    else:
+        print(f"resume index: {index_path}", flush=True)
+        print(f"resume catalog: {catalog_path}", flush=True)
+
+    catalog_tables = catalog["tables"]
+    known_names = {entry["table"] for entry in catalog_tables}
+    if requested:
+        missing_names = requested - known_names
+        if missing_names:
+            raise RuntimeError(
+                f"Requested tables absent from resume catalog: {sorted(missing_names)}"
+            )
+
+    completed_requested: set[str] = set()
+    executor: concurrent.futures.ProcessPoolExecutor | None = None
+    try:
+        if workers > 1:
+            executor = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
+
+        for entry in catalog_tables:
+            schema = str(entry["schema"])
+            table_name = str(entry["table"])
+            if requested and table_name not in requested:
+                continue
+
+            success_path = output / "tables" / table_name / "_SUCCESS.json"
+            if success_path.exists() and success_is_valid(success_path, identity):
+                print(
+                    f"SKIP {schema}.{table_name}: already complete (indexed; no source traversal)",
+                    flush=True,
+                )
+                completed_requested.add(table_name)
+                continue
+
+            final_dir = output / "tables" / table_name
+            if final_dir.exists():
+                raise RuntimeError(
+                    f"Existing table directory is not valid for this source: "
+                    f"{final_dir}. Remove or move it explicitly before rerun."
+                )
+
+            columns = [str(c) for c in entry["columns"]]
+            pg_table_types = {
+                str(k): str(v) for k, v in dict(entry["pg_types"]).items()
+            }
+            geometries = {
+                str(name): GeometrySpec(**dict(spec))
+                for name, spec in dict(entry["geometries"]).items()
+            }
+
+            proc: subprocess.Popen[bytes] | None = None
+            binary: BinaryIO | None = None
+            text: TextIO | None = None
+            try:
+                proc, binary = open_indexed_range(
+                    source=source,
+                    rapidgzip=rapidgzip,
+                    index_path=index_path,
+                    offset=int(entry["tar_offset"]),
+                    size=int(entry["range_size"]),
+                    gzip_threads=gzip_threads,
+                )
+                text = io.TextIOWrapper(
+                    binary, encoding="utf-8", errors="strict", newline=""
+                )
+                header = text.readline()
+                parsed = parse_ddl_line(header)
+                if parsed is None or parsed[0] != "copy":
+                    raise RuntimeError(
+                        f"Indexed range for {table_name} does not start with COPY"
+                    )
+                _kind, payload = parsed
+                got_schema, got_table, got_columns = payload
+                if (
+                    got_schema != schema
+                    or got_table != table_name
+                    or got_columns != columns
+                ):
+                    raise RuntimeError(
+                        f"Indexed COPY header mismatch for {table_name}"
+                    )
+
+                writer = TableWriter(
+                    output_root=output,
+                    schema_name=schema,
+                    table=table_name,
+                    columns=columns,
+                    pg_types=pg_table_types,
+                    geometries=geometries,
+                    source=identity,
+                    batch_rows=args.batch_rows,
+                    file_rows=args.file_rows,
+                    compression_level=args.compression_level,
+                    reference=references.get(table_name),
+                    allow_type_fallback=args.allow_type_fallback,
+                    executor=executor,
+                    workers=workers,
+                    max_in_flight=max_in_flight,
+                )
+                print(
+                    f"START {schema}.{table_name}: {len(columns)} columns "
+                    f"(indexed offset={int(entry['tar_offset']):,})",
+                    flush=True,
+                )
+
+                while True:
+                    data_line = read_logical_copy_line(text)
+                    if data_line == "":
+                        raise EOFError(
+                            f"Unexpected EOF inside indexed COPY for {table_name}"
+                        )
+                    if data_line == r"\.":
+                        break
+                    writer.add_line(data_line)
+                    if writer.rows % 1_000_000 == 0:
+                        elapsed = max(time.monotonic() - writer.started, 1e-6)
+                        print(
+                            f"  {table_name}: {writer.rows:,} rows "
+                            f"({writer.rows / elapsed:,.0f} rows/s)",
+                            flush=True,
+                        )
+
+                success = writer.finish()
+                print(
+                    f"DONE  {table_name}: {success['rows']:,} rows, "
+                    f"{success['parts']} parts, "
+                    f"{success['parquet_bytes'] / 2**30:.3f} GiB",
+                    flush=True,
+                )
+                completed_requested.add(table_name)
+
+                # Consume the exact end of the requested range, then require
+                # rapidgzip to report success.
+                text.read()
+                text.detach()
+                text = None
+                binary.close()
+                binary = None
+                rc = proc.wait()
+                if rc != 0:
+                    raise RuntimeError(
+                        f"rapidgzip indexed read failed for {table_name} "
+                        f"with exit status {rc}"
+                    )
+                proc = None
+            finally:
+                if text is not None:
+                    try:
+                        text.detach()
+                    except Exception:
+                        pass
+                if binary is not None:
+                    try:
+                        binary.close()
+                    except Exception:
+                        pass
+                if proc is not None and proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    if requested:
+        missing = requested - completed_requested
+        if missing:
+            raise RuntimeError(
+                f"Requested tables not found/completed: {sorted(missing)}"
+            )
+
+    manifest = build_manifest(output)
+    print(f"manifest    : {len(manifest)} completed tables", flush=True)
+    print(f"COPY blocks : {len(catalog_tables)} (indexed)", flush=True)
+    return 0
+
 def convert(args: argparse.Namespace) -> int:
     source = args.source.expanduser().resolve()
     output = args.output.expanduser().resolve()
@@ -652,6 +877,20 @@ def convert(args: argparse.Namespace) -> int:
     print(f"workers     : {workers}", flush=True)
     print(f"gzip threads: {gzip_threads}", flush=True)
     print(f"in-flight   : {max_in_flight}", flush=True)
+
+    if not args.dry_run and not args.no_indexed_resume:
+        return convert_indexed(
+            args,
+            source=source,
+            output=output,
+            rapidgzip=rapidgzip,
+            identity=identity,
+            requested=requested,
+            references=references,
+            workers=workers,
+            gzip_threads=gzip_threads,
+            max_in_flight=max_in_flight,
+        )
 
     pg_types: dict[tuple[str, str], dict[str, str]] = {}
     geoms: dict[tuple[str, str], dict[str, GeometrySpec]] = {}
@@ -810,6 +1049,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--reference", type=Path, default=DEFAULT_REFERENCE)
     p.add_argument("--rapidgzip", help="Path to rapidgzip CLI")
     p.add_argument("--tables", nargs="*", help="Convert only these table names")
+    p.add_argument(
+        "--no-indexed-resume",
+        action="store_true",
+        help="Disable rapidgzip random-access resume and use sequential streaming",
+    )
+    p.add_argument(
+        "--rebuild-resume-index",
+        action="store_true",
+        help="Rebuild the rapidgzip index and COPY-offset catalog",
+    )
+    p.add_argument(
+        "--resume-index",
+        type=Path,
+        help="Path to rapidgzip .gzidx (default: OUTPUT/_resume/bdnb-pgdump.gzidx)",
+    )
+    p.add_argument(
+        "--resume-catalog",
+        type=Path,
+        help="Path to COPY-offset catalog (default: OUTPUT/_resume/copy-offsets.json)",
+    )
     p.add_argument("--batch-rows", type=int, default=100_000)
     p.add_argument(
         "--file-rows",
