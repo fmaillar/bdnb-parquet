@@ -122,7 +122,19 @@ def arrow_type_for(pg_type: str) -> tuple[pa.DataType, str | None]:
     return typ, fallback
 
 
-def geometry_metadata(geometries: dict[str, GeometrySpec], columns: list[str]) -> bytes | None:
+def geometry_metadata(geometries: dict[str, GeometrySpec], columns: list[str])-> bytes | None:
+
+    canonical_geometry_types = {
+        "POINT": "Point",
+        "MULTIPOINT": "MultiPoint",
+        "LINESTRING": "LineString",
+        "MULTILINESTRING": "MultiLineString",
+        "POLYGON": "Polygon",
+        "MULTIPOLYGON": "MultiPolygon",
+        "GEOMETRYCOLLECTION": "GeometryCollection",
+    }
+
+    geometry_type = canonical_geometry_types[geom.geometry_type.upper()]
     selected = [geometries[c] for c in columns if c in geometries]
     if not selected:
         return None
@@ -132,7 +144,7 @@ def geometry_metadata(geometries: dict[str, GeometrySpec], columns: list[str]) -
         suffix = " Z" if geom.dimensions == 3 else ""
         geo_cols[geom.name] = {
             "encoding": "WKB",
-            "geometry_types": [geom.geometry_type + suffix],
+            "geometry_types": [geometry_type + suffix],
             "crs": crs,
         }
     payload = {
