@@ -516,8 +516,34 @@ def skip_copy(text: TextIO) -> int:
         rows += 1
 
 
+def split_copy_fields(line: str) -> list[str]:
+    """Split PostgreSQL COPY text fields on unescaped tab delimiters.
+
+    COPY text permits a literal delimiter in a field when it is preceded by an
+    odd number of backslashes. A simple str.split("\\t") therefore corrupts
+    such rows by inventing an extra column.
+    """
+    fields: list[str] = []
+    start = 0
+    backslashes = 0
+
+    for i, char in enumerate(line):
+        if char == "\\\\":
+            backslashes += 1
+            continue
+
+        if char == "\t" and backslashes % 2 == 0:
+            fields.append(line[start:i])
+            start = i + 1
+
+        backslashes = 0
+
+    fields.append(line[start:])
+    return fields
+
+
 def parse_copy_row(line: str) -> list[str | None]:
-    return [pg_copy_unescape(v) for v in line.split("\t")]
+    return [pg_copy_unescape(v) for v in split_copy_fields(line)]
 
 
 def open_sql_stream(
