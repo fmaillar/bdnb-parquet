@@ -25,6 +25,15 @@ CONSTRAINT_RE = re.compile(
 )
 
 
+def normalize_iso_datetime(value: str) -> str:
+    return (
+        value
+        .replace("/", "-")
+        .replace(".", "-")
+        .replace(" ", "T", 1)
+    )
+
+
 @dataclass(frozen=True)
 class GeometrySpec:
     name: str
@@ -302,10 +311,11 @@ def convert_scalar(value: str | None, pg_type: str) -> Any:
     if t in {"numeric", "decimal"}:
         return float(value)
     if t == "date":
-        return date.fromisoformat(value.replace("/", "."))
+        return date.fromisoformat(
+            value.replace("/", "-").replace(".", "-")
+        )
     if t.startswith("timestamp"):
-        normalized = value.replace("/", ".").replace(" ", "T", 1)
-        dt = datetime.fromisoformat(normalized)
+        dt = datetime.fromisoformat(normalize_iso_datetime(value))
         if "with time zone" in t or t.startswith("timestamptz"):
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
