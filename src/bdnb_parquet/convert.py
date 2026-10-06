@@ -528,7 +528,7 @@ def split_copy_fields(line: str) -> list[str]:
     backslashes = 0
 
     for i, char in enumerate(line):
-        if char == "\\\\":
+        if char == "\\":
             backslashes += 1
             continue
 
