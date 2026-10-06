@@ -65,6 +65,10 @@ class ParserTests(unittest.TestCase):
             convert_value("2025.04.22T22:00:00", "timestamp"),
             datetime(2025, 4, 22, 22, 0, 0),
         )
+        self.assertEqual(
+            convert_value("2025.04.23T16:48:56.921", "timestamp"),
+            datetime(2025, 4, 23, 16, 48, 56, 921000),
+        )
         self.assertEqual(convert_value("1", "bool"), True)
         self.assertEqual(convert_value("0", "bool"), False)
         self.assertEqual(convert_value("{a,b}", "text[]"), ["a", "b"])
