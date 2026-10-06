@@ -322,23 +322,32 @@ def convert_scalar(value: str | None, pg_type: str) -> Any:
         try:
             dt = datetime.fromisoformat(normalized)
         except ValueError as exc:
-            # Python datetime rejects leap-second notation (:60), while
-            # PostgreSQL dumps can contain it. Arrow timestamps cannot encode
-            # second=60 either, so normalize it to the following instant.
-            match = re.match(
-                r"^(.*T\\d{2}:\\d{2}):60(\\.\\d+)?(Z|[+-]\\d{2}(?::?\\d{2})?)?$",
-                normalized,
-            )
-            if match is None:
+            # Python/Arrow cannot represent second=60. Detect a leap-second
+            # timestamp structurally and normalize it to the following instant.
+            tpos = normalized.find("T")
+            if tpos < 0:
                 raise ValueError(
                     f"Invalid PostgreSQL timestamp {value!r} "
                     f"(normalized {normalized!r})"
                 ) from exc
-            prefix, fraction, zone = match.groups()
-            base = datetime.fromisoformat(
-                prefix + ":59" + (fraction or "") + (zone or "")
-            )
+
+            time_part = normalized[tpos + 1 :]
+            if len(time_part) < 8 or time_part[2] != ":" or time_part[5] != ":":
+                raise ValueError(
+                    f"Invalid PostgreSQL timestamp {value!r} "
+                    f"(normalized {normalized!r})"
+                ) from exc
+
+            if time_part[6:8] != "60":
+                raise ValueError(
+                    f"Invalid PostgreSQL timestamp {value!r} "
+                    f"(normalized {normalized!r})"
+                ) from exc
+
+            repaired = normalized[: tpos + 1] + time_part[:6] + "59" + time_part[8:]
+            base = datetime.fromisoformat(repaired)
             dt = base + timedelta(seconds=1)
+
         if "with time zone" in t or t.startswith("timestamptz"):
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
