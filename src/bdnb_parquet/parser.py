@@ -302,9 +302,10 @@ def convert_scalar(value: str | None, pg_type: str) -> Any:
     if t in {"numeric", "decimal"}:
         return float(value)
     if t == "date":
-        return date.fromisoformat(value)
+        return date.fromisoformat(value.replace("/", "."))
     if t.startswith("timestamp"):
-        dt = datetime.fromisoformat(value.replace(" ", "T", 1))
+        normalized = value.replace("/", ".").replace(" ", "T", 1)
+        dt = datetime.fromisoformat(normalized)
         if "with time zone" in t or t.startswith("timestamptz"):
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
