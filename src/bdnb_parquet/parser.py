@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import struct
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -318,7 +318,27 @@ def convert_scalar(value: str | None, pg_type: str) -> Any:
     if t == "date":
         return date.fromisoformat(normalize_iso_datetime(value))
     if t.startswith("timestamp"):
-        dt = datetime.fromisoformat(normalize_iso_datetime(value))
+        normalized = normalize_iso_datetime(value)
+        try:
+            dt = datetime.fromisoformat(normalized)
+        except ValueError as exc:
+            # Python datetime rejects leap-second notation (:60), while
+            # PostgreSQL dumps can contain it. Arrow timestamps cannot encode
+            # second=60 either, so normalize it to the following instant.
+            match = re.match(
+                r"^(.*T\\d{2}:\\d{2}):60(\\.\\d+)?(Z|[+-]\\d{2}(?::?\\d{2})?)?$",
+                normalized,
+            )
+            if match is None:
+                raise ValueError(
+                    f"Invalid PostgreSQL timestamp {value!r} "
+                    f"(normalized {normalized!r})"
+                ) from exc
+            prefix, fraction, zone = match.groups()
+            base = datetime.fromisoformat(
+                prefix + ":59" + (fraction or "") + (zone or "")
+            )
+            dt = base + timedelta(seconds=1)
         if "with time zone" in t or t.startswith("timestamptz"):
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
