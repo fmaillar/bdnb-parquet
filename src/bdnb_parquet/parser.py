@@ -26,13 +26,17 @@ CONSTRAINT_RE = re.compile(
 
 
 def normalize_iso_datetime(value: str) -> str:
-    """Normalize only the date separators, preserving fractional seconds."""
-    normalized = re.sub(
-        r"^(\\d{4})[./](\\d{2})[./](\\d{2})",
-        r"\\1-\\2-\\3",
-        value,
-    )
-    return normalized.replace(" ", "T", 1)
+    """Normalize YYYY/MM/DD or YYYY.MM.DD while preserving the time part."""
+    if (
+        len(value) >= 10
+        and value[4] in "./"
+        and value[7] in "./"
+        and value[:4].isdigit()
+        and value[5:7].isdigit()
+        and value[8:10].isdigit()
+    ):
+        value = f"{value[:4]}-{value[5:7]}-{value[8:]}"
+    return value.replace(" ", "T", 1)
 
 
 @dataclass(frozen=True)
@@ -312,12 +316,7 @@ def convert_scalar(value: str | None, pg_type: str) -> Any:
     if t in {"numeric", "decimal"}:
         return float(value)
     if t == "date":
-        normalized = re.sub(
-            r"^(\\d{4})[./](\\d{2})[./](\\d{2})$",
-            r"\\1-\\2-\\3",
-            value,
-        )
-        return date.fromisoformat(normalized)
+        return date.fromisoformat(normalize_iso_datetime(value))
     if t.startswith("timestamp"):
         dt = datetime.fromisoformat(normalize_iso_datetime(value))
         if "with time zone" in t or t.startswith("timestamptz"):
