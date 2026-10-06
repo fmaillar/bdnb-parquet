@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- add persistent rapidgzip random-access index and COPY-block offset catalog;
+- resume directly at incomplete tables without reparsing completed COPY data;
+- store PostgreSQL column and geometry metadata in the resume catalog;
+- add `--rebuild-resume-index`, `--resume-index`, `--resume-catalog`, and `--no-indexed-resume`;
+- accept slash- and dot-separated BDNB dates and timestamps;
+- add regression tests for indexed COPY ranges and alternate date separators.
+
 ## 0.2.0
 
 - add bounded multi-core Parquet conversion with `ProcessPoolExecutor`;
