@@ -1,5 +1,5 @@
 import unittest
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from bdnb_parquet.parser import (
@@ -55,6 +55,16 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(convert_value("12", "int4"), 12)
         self.assertEqual(convert_value("12.340", "numeric(17, 3)"), Decimal("12.340"))
         self.assertEqual(convert_value("2026-05-01", "date"), date(2026, 5, 1))
+        self.assertEqual(convert_value("2026/05/01", "date"), date(2026, 5, 1))
+        self.assertEqual(convert_value("2026.05.01", "date"), date(2026, 5, 1))
+        self.assertEqual(
+            convert_value("2025/04/22T22:00:00", "timestamp"),
+            datetime(2025, 4, 22, 22, 0, 0),
+        )
+        self.assertEqual(
+            convert_value("2025.04.22T22:00:00", "timestamp"),
+            datetime(2025, 4, 22, 22, 0, 0),
+        )
         self.assertEqual(convert_value("1", "bool"), True)
         self.assertEqual(convert_value("0", "bool"), False)
         self.assertEqual(convert_value("{a,b}", "text[]"), ["a", "b"])
