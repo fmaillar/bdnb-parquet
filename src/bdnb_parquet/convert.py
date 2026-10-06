@@ -134,12 +134,12 @@ def geometry_metadata(geometries: dict[str, GeometrySpec], columns: list[str])->
         "GEOMETRYCOLLECTION": "GeometryCollection",
     }
 
-    geometry_type = canonical_geometry_types[geom.geometry_type.upper()]
     selected = [geometries[c] for c in columns if c in geometries]
     if not selected:
         return None
     geo_cols: dict[str, Any] = {}
     for geom in selected:
+        geometry_type = canonical_geometry_types[geom.geometry_type.upper()]        
         crs = CRS.from_epsg(geom.srid).to_json_dict()
         suffix = " Z" if geom.dimensions == 3 else ""
         geo_cols[geom.name] = {
