@@ -166,30 +166,37 @@ gdf = gpd.read_parquet(
 - unknown PostgreSQL types fail closed unless `--allow-type-fallback` is explicitly supplied.
 
 
-## Dataset layer audit
+## Dataset migration audit
 
-The repository also provides a read-only inventory tool for the wider dataset
-warehouse. It compares the `raw/`, legacy `numpy/`, and canonical
-`parquet/` trees by relative path and reports allocated disk usage, file
-counts, layer presence, and migration status.
-
-Example:
+The repository also provides a read-only migration inventory for the wider
+dataset warehouse. It scans dataset **leaf directories** under `raw/`,
+legacy `numpy/`, and canonical `parquet/`, profiles their file formats and
+allocated size, and proposes conservative cross-layer matches.
 
 ```bash
 bdnb-datasets-audit \
   --root /mnt/data/datasets \
-  --depth 3 \
-  --output /tmp/datasets-layer-audit.tsv
+  --output /tmp/datasets-migration-audit.tsv
 ```
 
-Useful statuses include:
+The TSV reports source format profiles, sizes, proposed `raw -> numpy` and
+`raw -> parquet` matches, match reasons/scores, and an action:
 
-- `raw-only`: source exists and still needs a canonical Parquet conversion;
-- `legacy-derived-only`: source plus legacy `numpy/` output, but no canonical
-  Parquet output at the same relative path;
-- `parquet-present`: source and canonical Parquet output are both present;
-- `numpy-without-raw`, `parquet-without-raw`, and
-  `derived-without-raw`: derived data without an exact matching raw path,
-  which requires manual review before deletion.
+- `convert-raw-to-parquet`: no plausible canonical Parquet dataset found;
+- `validate-parquet`: a plausible Parquet equivalent exists and must be
+  validated before considering the legacy `numpy/` derivative redundant;
+- `manual-review`: a derived dataset has no unambiguous raw match.
 
-The audit intentionally does not delete or modify any dataset.
+Matching is deliberately conservative. Exact relative paths score highest,
+followed by same-parent/same-name and unique normalized-name matches. A match
+is a migration candidate, not proof of semantic equivalence: deletion of
+`numpy/` is only appropriate after format-specific validation.
+
+The intended warehouse lifecycle is:
+
+```text
+raw/  --controlled conversion-->  parquet/
+numpy/                          ->  legacy layer to retire after validation
+```
+
+The audit never modifies or deletes dataset content.
