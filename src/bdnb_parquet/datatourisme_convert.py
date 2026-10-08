@@ -321,7 +321,17 @@ def convert_csv_file(source: Path, output_root: Path) -> dict[str, Any]:
             writer.close()
 
     if writer is None:
-        raise RuntimeError(f"No rows read from CSV: {source}")
+        empty_schema = pa.schema(
+            [pa.field(name, pa.string(), nullable=True) for name in header]
+        )
+        pq.write_table(
+            pa.Table.from_batches([], schema=empty_schema),
+            tmp,
+            compression="zstd",
+            compression_level=3,
+            use_dictionary=True,
+            write_statistics=True,
+        )
 
     pf = pq.ParquetFile(tmp)
     if pf.metadata.num_rows != rows:
