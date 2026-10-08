@@ -27,6 +27,8 @@ from pyproj import CRS
 DEFAULT_ROOT = Path("/mnt/data/datasets")
 RAW = "raw"
 PARQUET = "parquet"
+MIN_FREE_BYTES = 20 * 2**30
+MAX_SPREADSHEET_BYTES = 128 * 2**20
 
 ALREADY_HANDLED = {
     "territoire-geospatial/cadastre/batiments/base-donnees-nationale",
@@ -439,13 +441,24 @@ class Migrator:
         self.parquet_root = self.root / PARQUET
         self.log_path = log_path
         self.max_depth = max_depth
+        self.temp_root = self.root / ".migration-tmp"
         self.counts: Counter[str] = Counter()
 
     def log(self, **record: Any) -> None:
         record.setdefault("time", utc_now())
-        append_jsonl(self.log_path, record)
         status = str(record.get("status", "event"))
         self.counts[status] += 1
+        try:
+            append_jsonl(self.log_path, record)
+        except Exception as exc:
+            # Logging must not abort a long migration. Mirror the failure to
+            # stderr; data conversion can continue unless the filesystem itself
+            # is unusable.
+            print(
+                f"LOGGING ERROR: {type(exc).__name__}: {exc}; record={record!r}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def output_for(self, src: Path) -> Path:
         rel = src.relative_to(self.raw_root)
@@ -458,6 +471,15 @@ class Migrator:
         else:
             name = src.stem if src.suffix else src.name
         return parent / f"{name}.parquet"
+
+    def ensure_free_space(self, required: int = 0) -> None:
+        usage = shutil.disk_usage(self.root)
+        needed = max(MIN_FREE_BYTES, required)
+        if usage.free < needed:
+            raise RuntimeError(
+                f"insufficient free space: {usage.free / 2**30:.1f} GiB free, "
+                f"{needed / 2**30:.1f} GiB required"
+            )
 
     def migrate_file(self, src: Path, *, depth: int = 0, base_output: Path | None = None) -> None:
         if depth > self.max_depth:
@@ -520,6 +542,18 @@ class Migrator:
                 return
 
             if kind in {"xlsx", "xls", "ods"}:
+                if src.stat().st_size > MAX_SPREADSHEET_BYTES:
+                    self.log(
+                        status="unsupported",
+                        source=str(src),
+                        kind=kind,
+                        reason=(
+                            "spreadsheet deferred for overnight safety: "
+                            f"{src.stat().st_size / 2**20:.1f} MiB exceeds "
+                            f"{MAX_SPREADSHEET_BYTES / 2**20:.0f} MiB limit"
+                        ),
+                    )
+                    return
                 target_dir = dst.with_suffix("")
                 results = spreadsheet_to_parquet(src, target_dir)
                 self.log(status="done", source=str(src), output=str(target_dir), kind=kind, sheets=len(results), rows=sum(int(x.get("rows", 0)) for x in results))
@@ -532,9 +566,31 @@ class Migrator:
                 if marker.exists():
                     self.log(status="skip", source=str(src), output=str(target_root), kind="zip")
                     return
+                if target_root.exists():
+                    self.log(
+                        status="failed",
+                        source=str(src),
+                        output=str(target_root),
+                        kind="zip",
+                        error="existing archive output lacks _SUCCESS marker",
+                    )
+                    return
+
+                with zipfile.ZipFile(src) as zf:
+                    members = safe_zip_members(zf)
+                    unpacked_bytes = sum(int(info.file_size) for info in members)
+                # Need room for extraction plus a safety reserve. Parquet output
+                # is written on the same filesystem but generally compresses.
+                self.ensure_free_space(unpacked_bytes + MIN_FREE_BYTES)
+
                 staging = target_root.with_name(target_root.name + ".staging")
                 staging.mkdir(parents=True, exist_ok=True)
-                with tempfile.TemporaryDirectory(prefix="bdnb-zip-") as td:
+                self.temp_root.mkdir(parents=True, exist_ok=True)
+                failed_before = self.counts["failed"]
+                with tempfile.TemporaryDirectory(
+                    prefix="bdnb-zip-",
+                    dir=self.temp_root,
+                ) as td:
                     extracted = extract_zip(src, Path(td))
                     # Process .shp once; sidecars stay present in temp tree.
                     shapefiles = {p for p in extracted if suffix_kind(p) == "shapefile"}
@@ -554,15 +610,21 @@ class Migrator:
                         else:
                             member_output = Path(str(member_output) + ".parquet")
                         self.migrate_file(member, depth=depth + 1, base_output=member_output)
+                if self.counts["failed"] > failed_before:
+                    self.log(
+                        status="partial",
+                        source=str(src),
+                        output=str(staging),
+                        kind="zip",
+                        reason="one or more archive members failed; staging preserved for resume",
+                    )
+                    return
+
                 atomic_json(staging / "_SUCCESS.json", {
                     "status": "ok",
                     "created_at": utc_now(),
                     "source": str(src),
                 })
-                if target_root.exists():
-                    raise RuntimeError(
-                        f"refusing to overwrite existing archive output without marker: {target_root}"
-                    )
                 os.replace(staging, target_root)
                 self.log(status="done", source=str(src), output=str(target_root), kind="zip")
                 return
@@ -603,6 +665,8 @@ class Migrator:
         if not self.raw_root.exists():
             raise FileNotFoundError(self.raw_root)
         self.parquet_root.mkdir(parents=True, exist_ok=True)
+        self.temp_root.mkdir(parents=True, exist_ok=True)
+        self.ensure_free_space()
 
         files: list[Path] = []
         for dirpath, dirnames, filenames in os.walk(self.raw_root, topdown=True):
@@ -619,7 +683,20 @@ class Migrator:
         for idx, src in enumerate(files, start=1):
             if idx == 1 or idx % 25 == 0:
                 print(f"[{idx}/{total}] {src.relative_to(self.raw_root)}", flush=True)
-            self.migrate_file(src)
+            try:
+                self.migrate_file(src)
+            except KeyboardInterrupt:
+                raise
+            except BaseException as exc:
+                # Last-resort isolation boundary. Catching BaseException here
+                # prevents unusual library exceptions from killing the whole
+                # unattended campaign; KeyboardInterrupt remains intentional.
+                self.log(
+                    status="failed",
+                    source=str(src),
+                    error=f"top-level {type(exc).__name__}: {exc}",
+                    traceback=traceback.format_exc(limit=8),
+                )
 
         summary = {
             "created_at": utc_now(),
