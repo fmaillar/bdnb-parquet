@@ -71,5 +71,23 @@ class DatasetAuditTests(unittest.TestCase):
             self.assertEqual(reason, "same-name")
 
 
+    def test_parquet_marker_stops_at_dataset_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "parquet"
+            dataset = root / "domain" / "dataset-x"
+            table = dataset / "tables" / "table-a"
+            table.mkdir(parents=True)
+            (dataset / "dataset.json").write_text("{}")
+            (dataset / "manifest.json").write_text("{}")
+            (table / "part-00000.parquet").write_bytes(b"x")
+
+            found = scan_leaf_datasets(root, "parquet")
+
+            self.assertEqual(len(found), 1)
+            self.assertEqual(found[0].relative_path, "domain/dataset-x")
+            self.assertGreaterEqual(found[0].files, 3)
+
+
+
 if __name__ == "__main__":
     unittest.main()
