@@ -122,8 +122,13 @@ def candidate_score(source: Dataset, target: Dataset) -> tuple[int, str]:
     src_tokens = {t for t in src_leaf.split("-") if len(t) >= 4}
     dst_tokens = {t for t in dst_leaf.split("-") if len(t) >= 4}
     if src_tokens and dst_tokens:
-        overlap = len(src_tokens & dst_tokens) / len(src_tokens | dst_tokens)
-        if overlap >= 0.75 and parent_key(source.relative_path) == parent_key(target.relative_path):
+        common = src_tokens & dst_tokens
+        overlap = len(common) / len(src_tokens | dst_tokens)
+        if (
+            len(common) >= 2
+            and overlap >= 0.75
+            and parent_key(source.relative_path) == parent_key(target.relative_path)
+        ):
             return 60, "same-parent+similar-name"
 
     return 0, ""
