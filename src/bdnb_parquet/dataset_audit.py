@@ -155,9 +155,29 @@ def parent_key(path: str) -> str:
     return normalized_name("/".join(p.parts[:-1]))
 
 
+def is_path_ancestor(parent: str, child: str) -> bool:
+    p = Path(parent).parts
+    c = Path(child).parts
+    return len(p) < len(c) and c[: len(p)] == p
+
+
+def same_parent_tree(a: str, b: str) -> bool:
+    pa = Path(a)
+    pb = Path(b)
+    return pa.parent == pb.parent
+
+
 def candidate_score(source: Dataset, target: Dataset) -> tuple[int, str]:
     if source.relative_path == target.relative_path:
         return 100, "exact-path"
+
+    # Canonical derived datasets are often nested below one raw dataset root
+    # (for example BDNB), or legacy outputs may fan out below the same root
+    # (for example IMOPE departments).
+    if is_path_ancestor(source.relative_path, target.relative_path):
+        return 95, "raw-parent-of-derived"
+    if is_path_ancestor(target.relative_path, source.relative_path):
+        return 85, "derived-parent-of-raw"
 
     src = Path(source.relative_path)
     dst = Path(target.relative_path)
@@ -169,7 +189,6 @@ def candidate_score(source: Dataset, target: Dataset) -> tuple[int, str]:
     if src_leaf == dst_leaf:
         return 70, "same-name"
 
-    # Conservative token overlap for renamed derived datasets.
     src_tokens = {t for t in src_leaf.split("-") if len(t) >= 4}
     dst_tokens = {t for t in dst_leaf.split("-") if len(t) >= 4}
     if src_tokens and dst_tokens:
@@ -193,10 +212,20 @@ def best_candidate(source: Dataset, targets: list[Dataset]) -> tuple[Dataset | N
             ranked.append((score, reason, target))
     if not ranked:
         return None, 0, ""
-    ranked.sort(key=lambda item: (-item[0], item[2].relative_path))
+
+    ranked.sort(
+        key=lambda item: (
+            -item[0],
+            len(Path(item[2].relative_path).parts),
+            item[2].relative_path,
+        )
+    )
     best_score, best_reason, best = ranked[0]
 
-    # Avoid asserting ambiguous name-only matches.
+    # For exact/ancestor relationships, multiple children are legitimate.
+    if best_reason in {"exact-path", "raw-parent-of-derived", "derived-parent-of-raw"}:
+        return best, best_score, best_reason
+
     if len(ranked) > 1 and ranked[1][0] == best_score and best_score < 100:
         return None, 0, "ambiguous"
     return best, best_score, best_reason
@@ -204,6 +233,20 @@ def best_candidate(source: Dataset, targets: list[Dataset]) -> tuple[Dataset | N
 
 def gib(value: int) -> str:
     return f"{value / 2**30:.3f}"
+
+
+def all_structural_matches(source: Dataset, targets: list[Dataset]) -> list[Dataset]:
+    matches: list[Dataset] = []
+    for target in targets:
+        score, reason = candidate_score(source, target)
+        if score >= 85 and reason in {
+            "exact-path",
+            "raw-parent-of-derived",
+            "derived-parent-of-raw",
+            "same-parent+name",
+        }:
+            matches.append(target)
+    return matches
 
 
 def build_rows(datasets: dict[str, list[Dataset]]) -> list[dict[str, str | int]]:
@@ -215,18 +258,26 @@ def build_rows(datasets: dict[str, list[Dataset]]) -> list[dict[str, str | int]]
     matched_parquet: set[str] = set()
 
     for raw in datasets["raw"]:
+        np_struct = all_structural_matches(raw, numpy)
+        pq_struct = all_structural_matches(raw, parquet)
+
         np_match, np_score, np_reason = best_candidate(raw, numpy)
         pq_match, pq_score, pq_reason = best_candidate(raw, parquet)
+
+        for item in np_struct:
+            matched_numpy.add(item.relative_path)
+        for item in pq_struct:
+            matched_parquet.add(item.relative_path)
 
         if np_match:
             matched_numpy.add(np_match.relative_path)
         if pq_match:
             matched_parquet.add(pq_match.relative_path)
 
-        if pq_match and pq_score >= 60:
+        if pq_struct or (pq_match and pq_score >= 60):
             status = "parquet-candidate-present"
             action = "validate-parquet"
-        elif np_match and np_score >= 60:
+        elif np_struct or (np_match and np_score >= 60):
             status = "legacy-only"
             action = "convert-raw-to-parquet"
         else:
@@ -239,13 +290,33 @@ def build_rows(datasets: dict[str, list[Dataset]]) -> list[dict[str, str | int]]
                 "raw_gib": gib(raw.bytes),
                 "raw_files": raw.files,
                 "raw_formats": raw.formats,
-                "numpy_path": np_match.relative_path if np_match else "",
-                "numpy_gib": gib(np_match.bytes) if np_match else "0.000",
-                "numpy_match": np_reason,
+                "numpy_path": (
+                    ";".join(item.relative_path for item in np_struct)
+                    if len(np_struct) > 1
+                    else (np_match.relative_path if np_match else "")
+                ),
+                "numpy_gib": gib(sum(item.bytes for item in np_struct)) if np_struct else (
+                    gib(np_match.bytes) if np_match else "0.000"
+                ),
+                "numpy_match": (
+                    "one-to-many-structural"
+                    if len(np_struct) > 1
+                    else np_reason
+                ),
                 "numpy_score": np_score,
-                "parquet_path": pq_match.relative_path if pq_match else "",
-                "parquet_gib": gib(pq_match.bytes) if pq_match else "0.000",
-                "parquet_match": pq_reason,
+                "parquet_path": (
+                    ";".join(item.relative_path for item in pq_struct)
+                    if len(pq_struct) > 1
+                    else (pq_match.relative_path if pq_match else "")
+                ),
+                "parquet_gib": gib(sum(item.bytes for item in pq_struct)) if pq_struct else (
+                    gib(pq_match.bytes) if pq_match else "0.000"
+                ),
+                "parquet_match": (
+                    "one-to-many-structural"
+                    if len(pq_struct) > 1
+                    else pq_reason
+                ),
                 "parquet_score": pq_score,
                 "status": status,
                 "action": action,
