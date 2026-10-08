@@ -21,6 +21,7 @@ Issues = "https://github.com/fmaillar/bdnb-parquet/issues"
 bdnb-parquet = "bdnb_parquet.convert:main"
 bdnb-datasets-audit = "bdnb_parquet.dataset_audit:main"
 bdnb-imope-promote = "bdnb_parquet.imope_promote:main"
+bdnb-promote-parquet = "bdnb_parquet.promote_parquet:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
