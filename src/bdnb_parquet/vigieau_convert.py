@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import struct
+import subprocess
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -206,6 +207,45 @@ def write_csv_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
     }
 
 
+def extract_with_7zip(
+    source: Path,
+    member_name: str,
+    target: Path,
+) -> None:
+    executable = (
+        shutil.which("7zz")
+        or shutil.which("7z")
+        or shutil.which("7za")
+    )
+    if executable is None:
+        raise RuntimeError(
+            "ZIP member uses Deflate64 (method 9), but no 7z/7zz/7za "
+            "executable is available"
+        )
+
+    with target.open("wb") as out:
+        proc = subprocess.run(
+            [
+                executable,
+                "x",
+                "-so",
+                str(source),
+                member_name,
+            ],
+            stdout=out,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    if proc.returncode != 0:
+        target.unlink(missing_ok=True)
+        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"7-Zip extraction failed with exit status {proc.returncode}: "
+            f"{stderr}"
+        )
+
+
 def extract_zip_member(source: Path, member_name: str, target: Path) -> int:
     """Extract one ZIP member, including Zstandard-compressed ZIP entries."""
     with zipfile.ZipFile(source) as zf:
@@ -215,6 +255,14 @@ def extract_zip_member(source: Path, member_name: str, target: Path) -> int:
                 shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
             return info.compress_type
         except NotImplementedError:
+            if info.compress_type == 9:
+                extract_with_7zip(source, member_name, target)
+                if target.stat().st_size != info.file_size:
+                    raise RuntimeError(
+                        f"ZIP member size mismatch: expected {info.file_size}, "
+                        f"got {target.stat().st_size}"
+                    )
+                return info.compress_type
             if info.compress_type not in {20, 93}:
                 raise RuntimeError(
                     f"unsupported ZIP compression method {info.compress_type}"
