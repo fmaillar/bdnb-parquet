@@ -164,3 +164,32 @@ gdf = gpd.read_parquet(
 - data is first written under `tables/.staging/<table>`;
 - `_SUCCESS.json` is created only after Parquet footer row counts have been re-read and validated;
 - unknown PostgreSQL types fail closed unless `--allow-type-fallback` is explicitly supplied.
+
+
+## Dataset layer audit
+
+The repository also provides a read-only inventory tool for the wider dataset
+warehouse. It compares the `raw/`, legacy `numpy/`, and canonical
+`parquet/` trees by relative path and reports allocated disk usage, file
+counts, layer presence, and migration status.
+
+Example:
+
+```bash
+bdnb-datasets-audit \
+  --root /mnt/data/datasets \
+  --depth 3 \
+  --output /tmp/datasets-layer-audit.tsv
+```
+
+Useful statuses include:
+
+- `raw-only`: source exists and still needs a canonical Parquet conversion;
+- `legacy-derived-only`: source plus legacy `numpy/` output, but no canonical
+  Parquet output at the same relative path;
+- `parquet-present`: source and canonical Parquet output are both present;
+- `numpy-without-raw`, `parquet-without-raw`, and
+  `derived-without-raw`: derived data without an exact matching raw path,
+  which requires manual review before deletion.
+
+The audit intentionally does not delete or modify any dataset.
