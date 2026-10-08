@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -149,6 +150,26 @@ def suffix_kind(path: Path) -> str:
     if path.suffix.lower() == ".7z":
         return "7z"
     return magic_kind(path)
+
+
+def stable_name(name: str) -> str:
+    digest = hashlib.sha256(name.encode("utf-8", errors="surrogatepass")).hexdigest()[:10]
+    return f"{slug(name)}-{digest}"
+
+
+def json_layout(path: Path, *, gzipped: bool = False) -> str:
+    opener = gzip.open if gzipped else open
+    mode = "rb"
+    with opener(path, mode) as fh:
+        chunk = fh.read(64 * 1024)
+    stripped = chunk.lstrip()
+    if not stripped:
+        return "empty"
+    if stripped.startswith(b"["):
+        return "array"
+    if stripped.startswith(b"{"):
+        return "object-stream"
+    return "unknown"
 
 
 def geo_metadata(meta: dict[str, Any], geometry_name: str) -> bytes:
@@ -306,6 +327,14 @@ def write_csv(src: Path, dst: Path, *, gzipped: bool = False) -> dict[str, Any]:
 
 def write_json(src: Path, dst: Path, *, gzipped: bool = False) -> dict[str, Any]:
     import pyarrow.json as pajson
+
+    layout = json_layout(src, gzipped=gzipped)
+    if layout == "array":
+        raise RuntimeError(
+            "top-level JSON arrays are deferred; streaming NDJSON/object records only"
+        )
+    if layout in {"empty", "unknown"}:
+        raise RuntimeError(f"unsupported JSON layout: {layout}")
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".tmp")
@@ -571,7 +600,7 @@ class Migrator:
                 return
 
             if kind == "zip":
-                archive_id = slug(src.stem or src.name)
+                archive_id = stable_name(src.name)
                 target_root = (dst.parent / archive_id) if dst.suffix else dst
                 marker = target_root / "_SUCCESS.json"
                 if marker.exists():
@@ -668,6 +697,86 @@ class Migrator:
                 traceback=traceback.format_exc(limit=8),
             )
 
+    def preflight(self) -> int:
+        if not self.raw_root.exists():
+            raise FileNotFoundError(self.raw_root)
+        self.parquet_root.mkdir(parents=True, exist_ok=True)
+        self.temp_root.mkdir(parents=True, exist_ok=True)
+        self.ensure_free_space()
+
+        files: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(self.raw_root, topdown=True):
+            base = Path(dirpath)
+            rel = base.relative_to(self.raw_root).as_posix()
+            if any(rel == handled or rel.startswith(handled + "/") for handled in ALREADY_HANDLED):
+                dirnames[:] = []
+                continue
+            files.extend(base / filename for filename in filenames)
+
+        destinations: dict[str, str] = {}
+        collisions: list[tuple[str, str, str]] = []
+        kinds: Counter[str] = Counter()
+        zip_errors: list[str] = []
+
+        for src in files:
+            kind = suffix_kind(src)
+            kinds[kind] += 1
+            dst = self.output_for(src)
+            if kind == "zip":
+                dest = str(dst.parent / stable_name(src.name))
+                try:
+                    with zipfile.ZipFile(src) as zf:
+                        # Reading central-directory metadata catches many broken
+                        # archives without decompressing their payloads.
+                        safe_zip_members(zf)
+                except Exception as exc:
+                    zip_errors.append(f"{src}: {type(exc).__name__}: {exc}")
+            else:
+                dest = str(dst)
+
+            previous = destinations.get(dest)
+            if previous is not None and previous != str(src):
+                collisions.append((dest, previous, str(src)))
+            else:
+                destinations[dest] = str(src)
+
+        # Dependency smoke checks for optional handlers.
+        dependency_errors: list[str] = []
+        for module in ("pandas", "openpyxl", "xlrd", "odf"):
+            try:
+                __import__(module)
+            except Exception as exc:
+                dependency_errors.append(f"{module}: {type(exc).__name__}: {exc}")
+
+        report = {
+            "created_at": utc_now(),
+            "files": len(files),
+            "kinds": dict(sorted(kinds.items())),
+            "collisions": collisions,
+            "zip_errors": zip_errors,
+            "dependency_errors": dependency_errors,
+            "free_gib": shutil.disk_usage(self.root).free / 2**30,
+        }
+        atomic_json(self.log_path.with_suffix(".preflight.json"), report)
+
+        print(f"PREFLIGHT: files={len(files)} free={report['free_gib']:.1f} GiB", flush=True)
+        print("KINDS:", " ".join(f"{k}={v}" for k, v in sorted(kinds.items())), flush=True)
+        print(
+            f"CHECKS: collisions={len(collisions)} "
+            f"zip_errors={len(zip_errors)} "
+            f"dependency_errors={len(dependency_errors)}",
+            flush=True,
+        )
+        if collisions or zip_errors or dependency_errors:
+            print(
+                f"PRECHECK FAILED: see {self.log_path.with_suffix('.preflight.json')}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        print("PRECHECK OK", flush=True)
+        return 0
+
     def run(self) -> int:
         if not self.raw_root.exists():
             raise FileNotFoundError(self.raw_root)
@@ -727,13 +836,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path("/tmp/bdnb-overnight-migrate.jsonl"),
     )
     parser.add_argument("--max-depth", type=int, default=4)
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="validate queue, destinations, ZIP metadata and dependencies without converting",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        return Migrator(args.root, log_path=args.log, max_depth=args.max_depth).run()
+        migrator = Migrator(args.root, log_path=args.log, max_depth=args.max_depth)
+        if args.preflight:
+            return migrator.preflight()
+        return migrator.run()
     except KeyboardInterrupt:
         print("Interrupted safely; rerun the same command to resume.", file=sys.stderr)
         return 130
