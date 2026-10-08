@@ -8,8 +8,6 @@ import json
 import os
 import re
 import shutil
-import sqlite3
-import subprocess
 import sys
 import tempfile
 import traceback
@@ -17,7 +15,7 @@ import zipfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.csv as pacsv
@@ -312,22 +310,38 @@ def write_json(src: Path, dst: Path, *, gzipped: bool = False) -> dict[str, Any]
     tmp.unlink(missing_ok=True)
 
     source: Any = gzip.open(src, "rb") if gzipped else src
+    writer: pq.ParquetWriter | None = None
+    rows = 0
     try:
-        table = pajson.read_json(source)
+        reader = pajson.open_json(
+            source,
+            read_options=pajson.ReadOptions(block_size=16 * 1024 * 1024),
+        )
+        for batch in reader:
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    tmp,
+                    batch.schema,
+                    compression="zstd",
+                    compression_level=3,
+                    use_dictionary=True,
+                    write_statistics=True,
+                )
+            writer.write_batch(batch)
+            rows += batch.num_rows
     finally:
+        if writer is not None:
+            writer.close()
         if gzipped and hasattr(source, "close"):
             source.close()
 
-    pq.write_table(
-        table,
-        tmp,
-        compression="zstd",
-        compression_level=3,
-        use_dictionary=True,
-        write_statistics=True,
-    )
+    if writer is None and not tmp.exists():
+        raise RuntimeError(
+            f"JSON produced no record batches (expected newline-delimited JSON): {src}"
+        )
+
     info = parquet_valid(tmp)
-    if info is None:
+    if info is None or info["rows"] != rows:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(f"invalid JSON Parquet output for {src}")
     os.replace(tmp, dst)
@@ -540,15 +554,16 @@ class Migrator:
                         else:
                             member_output = Path(str(member_output) + ".parquet")
                         self.migrate_file(member, depth=depth + 1, base_output=member_output)
-                atomic_json(marker if target_root.exists() else staging / "_SUCCESS.json", {
+                atomic_json(staging / "_SUCCESS.json", {
                     "status": "ok",
                     "created_at": utc_now(),
                     "source": str(src),
                 })
-                if not target_root.exists():
-                    os.replace(staging, target_root)
-                else:
-                    shutil.rmtree(staging, ignore_errors=True)
+                if target_root.exists():
+                    raise RuntimeError(
+                        f"refusing to overwrite existing archive output without marker: {target_root}"
+                    )
+                os.replace(staging, target_root)
                 self.log(status="done", source=str(src), output=str(target_root), kind="zip")
                 return
 
