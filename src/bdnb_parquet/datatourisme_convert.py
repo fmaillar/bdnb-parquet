@@ -263,9 +263,15 @@ def convert_csv_file(source: Path, output_root: Path) -> dict[str, Any]:
         }
 
     target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+
     reader = pacsv.open_csv(
         source,
         read_options=pacsv.ReadOptions(block_size=16 * 1024 * 1024),
+        parse_options=pacsv.ParseOptions(
+            newlines_in_values=True,
+        ),
         convert_options=pacsv.ConvertOptions(
             strings_can_be_null=True,
             null_values=["", "null", "NULL"],
@@ -279,7 +285,7 @@ def convert_csv_file(source: Path, output_root: Path) -> dict[str, Any]:
         for batch in reader:
             if writer is None:
                 writer = pq.ParquetWriter(
-                    target,
+                    tmp,
                     batch.schema,
                     compression="zstd",
                     compression_level=3,
@@ -296,9 +302,12 @@ def convert_csv_file(source: Path, output_root: Path) -> dict[str, Any]:
     if writer is None:
         raise RuntimeError(f"No rows read from CSV: {source}")
 
-    pf = pq.ParquetFile(target)
+    pf = pq.ParquetFile(tmp)
     if pf.metadata.num_rows != rows:
+        tmp.unlink(missing_ok=True)
         raise RuntimeError(f"CSV row-count mismatch: {source}")
+
+    os.replace(tmp, target)
 
     return {
         "source": source.name,
