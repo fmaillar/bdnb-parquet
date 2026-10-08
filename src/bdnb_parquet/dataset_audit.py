@@ -52,17 +52,64 @@ def format_name(path: Path) -> str:
     return path.suffix.lower() or "<no-ext>"
 
 
+def is_dataset_boundary(base: Path, filenames: list[str], layer: str) -> bool:
+    names = set(filenames)
+    if layer == "parquet":
+        return bool(
+            {"dataset.json", "manifest.json", "manifest.parquet"} & names
+        )
+    if layer == "numpy":
+        return any(name.endswith(".done.json") for name in filenames)
+    return False
+
+
 def scan_leaf_datasets(layer_root: Path, layer: str) -> list[Dataset]:
-    """Return directories containing files and no descendant directory with files."""
+    """Discover dataset roots without descending into known dataset internals.
+
+    Canonical parquet datasets may contain many nested table directories, so
+    marker files such as dataset.json/manifest.json define the dataset boundary.
+    Legacy numpy datasets may use *.done.json markers. Otherwise the fallback is
+    a directory containing files and no descendant directory containing files.
+    """
     if not layer_root.exists():
         return []
 
-    direct: dict[Path, tuple[int, int, Counter[str]]] = {}
-    children_with_data: set[Path] = set()
+    datasets: list[Dataset] = []
+    fallback_direct: dict[Path, tuple[int, int, Counter[str]]] = {}
+    fallback_children_with_data: set[Path] = set()
 
-    for dirpath, dirnames, filenames in os.walk(layer_root):
+    for dirpath, dirnames, filenames in os.walk(layer_root, topdown=True):
         base = Path(dirpath)
         dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+
+        if is_dataset_boundary(base, filenames, layer):
+            total = 0
+            count = 0
+            formats: Counter[str] = Counter()
+            for nested_dirpath, nested_dirnames, nested_filenames in os.walk(base):
+                nested_dirnames[:] = [
+                    name for name in nested_dirnames if not name.startswith(".")
+                ]
+                nested_base = Path(nested_dirpath)
+                for filename in nested_filenames:
+                    path = nested_base / filename
+                    try:
+                        total += allocated_size(path)
+                    except (FileNotFoundError, PermissionError, OSError):
+                        continue
+                    count += 1
+                    formats[format_name(path)] += 1
+
+            rel = base.relative_to(layer_root).as_posix()
+            fmt = ",".join(
+                f"{ext}:{n}"
+                for ext, n in sorted(
+                    formats.items(), key=lambda item: (-item[1], item[0])
+                )
+            )
+            datasets.append(Dataset(layer, rel, total, count, fmt))
+            dirnames[:] = []
+            continue
 
         total = 0
         count = 0
@@ -77,17 +124,21 @@ def scan_leaf_datasets(layer_root: Path, layer: str) -> list[Dataset]:
             formats[format_name(path)] += 1
 
         if count:
-            direct[base] = (total, count, formats)
+            fallback_direct[base] = (total, count, formats)
             parent = base.parent
             while parent != layer_root.parent and parent != layer_root:
-                children_with_data.add(parent)
+                fallback_children_with_data.add(parent)
                 parent = parent.parent
 
-    datasets: list[Dataset] = []
-    for base, (size, count, formats) in direct.items():
-        if base in children_with_data:
+    boundary_paths = {Path(d.relative_path) for d in datasets}
+    for base, (size, count, formats) in fallback_direct.items():
+        rel_path = base.relative_to(layer_root)
+        if any(boundary in rel_path.parents or boundary == rel_path for boundary in boundary_paths):
             continue
-        rel = base.relative_to(layer_root).as_posix()
+        if base in fallback_children_with_data:
+            continue
+
+        rel = rel_path.as_posix()
         fmt = ",".join(
             f"{ext}:{n}"
             for ext, n in sorted(formats.items(), key=lambda item: (-item[1], item[0]))
