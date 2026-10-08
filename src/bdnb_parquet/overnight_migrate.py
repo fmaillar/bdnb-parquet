@@ -463,14 +463,9 @@ class Migrator:
     def output_for(self, src: Path) -> Path:
         rel = src.relative_to(self.raw_root)
         parent = self.parquet_root / rel.parent
-        name = src.name
-        for ending in (".geojson.gz", ".json.gz", ".csv.gz"):
-            if name.lower().endswith(ending):
-                name = name[: -len(ending)]
-                break
-        else:
-            name = src.stem if src.suffix else src.name
-        return parent / f"{name}.parquet"
+        # Preserve the complete source filename in the destination name.
+        # foo.csv and foo.json must never collide on foo.parquet.
+        return parent / f"{src.name}.parquet"
 
     def ensure_free_space(self, required: int = 0) -> None:
         usage = shutil.disk_usage(self.root)
@@ -480,6 +475,17 @@ class Migrator:
                 f"insufficient free space: {usage.free / 2**30:.1f} GiB free, "
                 f"{needed / 2**30:.1f} GiB required"
             )
+
+    def reserve_for_source(self, src: Path, kind: str) -> None:
+        try:
+            size = src.stat().st_size
+        except OSError:
+            size = 0
+        # Compressed streams can expand substantially. This is deliberately
+        # conservative; ordinary uncompressed tabular/geospatial sources use
+        # source-size + reserve.
+        multiplier = 8 if kind in {"csv.gz", "json.gz"} else 1
+        self.ensure_free_space(size * multiplier + MIN_FREE_BYTES)
 
     def migrate_file(self, src: Path, *, depth: int = 0, base_output: Path | None = None) -> None:
         if depth > self.max_depth:
@@ -491,6 +497,7 @@ class Migrator:
 
         try:
             if kind == "parquet":
+                self.reserve_for_source(src, kind)
                 target = dst if dst.suffix == ".parquet" else dst.with_suffix(".parquet")
                 if parquet_valid(target) is not None:
                     self.log(status="skip", source=str(src), output=str(target), kind=kind)
@@ -500,6 +507,7 @@ class Migrator:
                 return
 
             if kind in {"csv", "tsv", "csv.gz"}:
+                self.reserve_for_source(src, kind)
                 target = dst if dst.suffix == ".parquet" else dst.with_suffix(".parquet")
                 if parquet_valid(target) is not None:
                     self.log(status="skip", source=str(src), output=str(target), kind=kind)
@@ -509,6 +517,7 @@ class Migrator:
                 return
 
             if kind in {"json", "json.gz"}:
+                self.reserve_for_source(src, kind)
                 target = dst if dst.suffix == ".parquet" else dst.with_suffix(".parquet")
                 if parquet_valid(target) is not None:
                     self.log(status="skip", source=str(src), output=str(target), kind=kind)
@@ -518,6 +527,7 @@ class Migrator:
                 return
 
             if kind in {"geojson", "kml", "shapefile"}:
+                self.reserve_for_source(src, kind)
                 target = dst if dst.suffix == ".parquet" else dst.with_suffix(".parquet")
                 if parquet_valid(target) is not None:
                     self.log(status="skip", source=str(src), output=str(target), kind=kind)
@@ -527,6 +537,7 @@ class Migrator:
                 return
 
             if kind in {"gpkg", "sqlite"}:
+                self.reserve_for_source(src, kind)
                 # Only treat SQLite as geospatial if pyogrio can enumerate layers.
                 try:
                     layers = list_layers(src)
@@ -602,13 +613,9 @@ class Migrator:
                         if member.suffix.lower() in {".dbf", ".shx", ".prj", ".cpg", ".qml", ".pdf", ".tif", ".tiff"}:
                             continue
                         rel = member.relative_to(td)
-                        member_output = staging / rel
-                        if member in shapefiles:
-                            member_output = member_output.with_suffix(".parquet")
-                        elif member_output.suffix:
-                            member_output = member_output.with_suffix(".parquet")
-                        else:
-                            member_output = Path(str(member_output) + ".parquet")
+                        # Preserve the complete member name to prevent collisions
+                        # such as foo.csv vs foo.json inside one archive.
+                        member_output = Path(str(staging / rel) + ".parquet")
                         self.migrate_file(member, depth=depth + 1, base_output=member_output)
                 if self.counts["failed"] > failed_before:
                     self.log(
@@ -687,10 +694,9 @@ class Migrator:
                 self.migrate_file(src)
             except KeyboardInterrupt:
                 raise
-            except BaseException as exc:
-                # Last-resort isolation boundary. Catching BaseException here
-                # prevents unusual library exceptions from killing the whole
-                # unattended campaign; KeyboardInterrupt remains intentional.
+            except Exception as exc:
+                # Last-resort per-file isolation boundary. Process-level events
+                # such as SystemExit and KeyboardInterrupt are not swallowed.
                 self.log(
                     status="failed",
                     source=str(src),
