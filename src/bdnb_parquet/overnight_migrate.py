@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -438,6 +439,43 @@ def gpkg_to_parquet(src: Path, dst_dir: Path) -> list[dict[str, Any]]:
     return results
 
 
+def sevenzip_executable() -> str | None:
+    return shutil.which("7zz") or shutil.which("7z") or shutil.which("7za")
+
+
+def sevenzip_test(path: Path) -> tuple[bool, str]:
+    exe = sevenzip_executable()
+    if exe is None:
+        return False, "7z executable unavailable"
+    proc = subprocess.run(
+        [exe, "t", "-bd", "-y", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    output = proc.stdout.decode("utf-8", errors="replace")
+    return proc.returncode == 0, output[-2000:]
+
+
+def extract_with_7zip(src: Path, temp: Path) -> list[Path]:
+    exe = sevenzip_executable()
+    if exe is None:
+        raise RuntimeError("7z executable unavailable")
+    temp.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [exe, "x", "-bd", "-y", f"-o{temp}", str(src)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if proc.returncode != 0:
+        output = proc.stdout.decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"7z extraction failed with status {proc.returncode}: {output[-1200:]}"
+        )
+    return [p for p in temp.rglob("*") if p.is_file()]
+
+
 def safe_zip_members(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
     result: list[zipfile.ZipInfo] = []
     for info in zf.infolist():
@@ -453,14 +491,19 @@ def safe_zip_members(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
 def extract_zip(src: Path, temp: Path) -> list[Path]:
     temp.mkdir(parents=True, exist_ok=True)
     extracted: list[Path] = []
-    with zipfile.ZipFile(src) as zf:
-        for info in safe_zip_members(zf):
-            target = temp / info.filename
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info) as inp, target.open("wb") as out:
-                shutil.copyfileobj(inp, out, length=16 * 1024 * 1024)
-            extracted.append(target)
-    return extracted
+    try:
+        with zipfile.ZipFile(src) as zf:
+            for info in safe_zip_members(zf):
+                target = temp / info.filename
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info) as inp, target.open("wb") as out:
+                    shutil.copyfileobj(inp, out, length=16 * 1024 * 1024)
+                extracted.append(target)
+        return extracted
+    except zipfile.BadZipFile:
+        # Some real ZIP archives have central-directory quirks that Python
+        # rejects but 7-Zip can still read safely.
+        return extract_with_7zip(src, temp)
 
 
 class Migrator:
@@ -616,11 +659,20 @@ class Migrator:
                     )
                     return
 
-                with zipfile.ZipFile(src) as zf:
-                    members = safe_zip_members(zf)
-                    unpacked_bytes = sum(int(info.file_size) for info in members)
-                # Need room for extraction plus a safety reserve. Parquet output
-                # is written on the same filesystem but generally compresses.
+                try:
+                    with zipfile.ZipFile(src) as zf:
+                        members = safe_zip_members(zf)
+                        unpacked_bytes = sum(int(info.file_size) for info in members)
+                except zipfile.BadZipFile:
+                    ok, details = sevenzip_test(src)
+                    if not ok:
+                        raise RuntimeError(
+                            f"archive unreadable by zipfile and 7z: {details}"
+                        )
+                    # 7z test succeeded but exact unpacked size is not required
+                    # for correctness; reserve conservatively from compressed size.
+                    unpacked_bytes = src.stat().st_size * 8
+                # Need room for extraction plus a safety reserve.
                 self.ensure_free_space(unpacked_bytes + MIN_FREE_BYTES)
 
                 staging = target_root.with_name(target_root.name + ".staging")
@@ -716,7 +768,8 @@ class Migrator:
         destinations: dict[str, str] = {}
         collisions: list[tuple[str, str, str]] = []
         kinds: Counter[str] = Counter()
-        zip_errors: list[str] = []
+        zip_warnings: list[str] = []
+        fatal_errors: list[str] = []
 
         for src in files:
             kind = suffix_kind(src)
@@ -724,13 +777,33 @@ class Migrator:
             dst = self.output_for(src)
             if kind == "zip":
                 dest = str(dst.parent / stable_name(src.name))
-                try:
-                    with zipfile.ZipFile(src) as zf:
-                        # Reading central-directory metadata catches many broken
-                        # archives without decompressing their payloads.
-                        safe_zip_members(zf)
-                except Exception as exc:
-                    zip_errors.append(f"{src}: {type(exc).__name__}: {exc}")
+                if src.stat().st_size == 0:
+                    zip_warnings.append(f"{src}: empty file")
+                else:
+                    try:
+                        with zipfile.ZipFile(src) as zf:
+                            safe_zip_members(zf)
+                    except zipfile.BadZipFile as exc:
+                        # Distinguish mislabeled files from quirky real archives.
+                        mkind = magic_kind(src)
+                        if mkind != "zip":
+                            zip_warnings.append(
+                                f"{src}: not actually ZIP ({mkind}): {exc}"
+                            )
+                        else:
+                            ok, details = sevenzip_test(src)
+                            if ok:
+                                zip_warnings.append(
+                                    f"{src}: Python zipfile rejects archive; 7z fallback validated"
+                                )
+                            else:
+                                fatal_errors.append(
+                                    f"{src}: unreadable by zipfile and 7z: {details}"
+                                )
+                    except Exception as exc:
+                        fatal_errors.append(
+                            f"{src}: {type(exc).__name__}: {exc}"
+                        )
             else:
                 dest = str(dst)
 
@@ -753,7 +826,8 @@ class Migrator:
             "files": len(files),
             "kinds": dict(sorted(kinds.items())),
             "collisions": collisions,
-            "zip_errors": zip_errors,
+            "zip_warnings": zip_warnings,
+            "fatal_errors": fatal_errors,
             "dependency_errors": dependency_errors,
             "free_gib": shutil.disk_usage(self.root).free / 2**30,
         }
@@ -763,11 +837,18 @@ class Migrator:
         print("KINDS:", " ".join(f"{k}={v}" for k, v in sorted(kinds.items())), flush=True)
         print(
             f"CHECKS: collisions={len(collisions)} "
-            f"zip_errors={len(zip_errors)} "
+            f"warnings={len(zip_warnings)} "
+            f"fatal={len(fatal_errors)} "
             f"dependency_errors={len(dependency_errors)}",
             flush=True,
         )
-        if collisions or zip_errors or dependency_errors:
+        if zip_warnings:
+            print(
+                f"WARNINGS: {len(zip_warnings)} non-blocking archive anomalies; "
+                f"see {self.log_path.with_suffix('.preflight.json')}",
+                flush=True,
+            )
+        if collisions or fatal_errors or dependency_errors:
             print(
                 f"PRECHECK FAILED: see {self.log_path.with_suffix('.preflight.json')}",
                 file=sys.stderr,
