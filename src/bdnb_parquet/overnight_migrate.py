@@ -797,12 +797,14 @@ class Migrator:
                                     f"{src}: Python zipfile rejects archive; 7z fallback validated"
                                 )
                             else:
-                                fatal_errors.append(
-                                    f"{src}: unreadable by zipfile and 7z: {details}"
+                                zip_warnings.append(
+                                    f"{src}: corrupt/unreadable archive; runtime will log failed and continue: "
+                                    f"{details}"
                                 )
                     except Exception as exc:
-                        fatal_errors.append(
-                            f"{src}: {type(exc).__name__}: {exc}"
+                        zip_warnings.append(
+                            f"{src}: archive metadata error; runtime will log failed and continue: "
+                            f"{type(exc).__name__}: {exc}"
                         )
             else:
                 dest = str(dst)
