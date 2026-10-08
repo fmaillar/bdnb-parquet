@@ -268,7 +268,8 @@ def convert_geojson_source(
                         result = future.result()
                     except Exception as exc:
                         raise RuntimeError(
-                            f"{source.name}/{member_name}: conversion failed"
+                            f"{source.name}/{member_name}: "
+                            f"conversion failed: {exc!r}"
                         ) from exc
                     results.append(result)
                     done += 1
