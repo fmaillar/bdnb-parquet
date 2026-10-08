@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import io
 import csv
 import json
 import os
@@ -9,6 +10,7 @@ import re
 import shutil
 import sys
 import tempfile
+import struct
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +21,7 @@ import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 from pyogrio.raw import open_arrow
 from pyproj import CRS
+import zstandard as zstd
 
 DEFAULT_SOURCE = Path(
     "/mnt/data/datasets/raw/climat-environnement/secheresse/vigieau"
@@ -203,6 +206,82 @@ def write_csv_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
     }
 
 
+def extract_zip_member(source: Path, member_name: str, target: Path) -> int:
+    """Extract one ZIP member, including Zstandard-compressed ZIP entries."""
+    with zipfile.ZipFile(source) as zf:
+        info = zf.getinfo(member_name)
+        try:
+            with zf.open(info) as src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
+            return info.compress_type
+        except NotImplementedError:
+            if info.compress_type not in {20, 93}:
+                raise RuntimeError(
+                    f"unsupported ZIP compression method {info.compress_type}"
+                )
+
+    # Python < 3.14 cannot read ZIP Zstandard entries. Read the raw compressed
+    # payload from the local file record and decompress the Zstandard frame.
+    with source.open("rb") as fh:
+        fh.seek(info.header_offset)
+        header = fh.read(30)
+        if len(header) != 30:
+            raise RuntimeError("truncated ZIP local header")
+        (
+            signature,
+            _version,
+            _flags,
+            method,
+            _mtime,
+            _mdate,
+            _crc,
+            _compressed_size,
+            _uncompressed_size,
+            filename_len,
+            extra_len,
+        ) = struct.unpack("<IHHHHHIIIHH", header)
+        if signature != 0x04034B50:
+            raise RuntimeError("invalid ZIP local header")
+        if method not in {20, 93}:
+            raise RuntimeError(f"unexpected ZIP compression method {method}")
+        fh.seek(filename_len + extra_len, os.SEEK_CUR)
+
+        remaining = info.compress_size
+        dctx = zstd.ZstdDecompressor()
+        with dctx.stream_reader(
+            io.BufferedReader(_LimitedReader(fh, remaining))
+        ) as reader, target.open("wb") as dst:
+            shutil.copyfileobj(reader, dst, length=16 * 1024 * 1024)
+
+    if target.stat().st_size != info.file_size:
+        raise RuntimeError(
+            f"ZIP member size mismatch: expected {info.file_size}, "
+            f"got {target.stat().st_size}"
+        )
+    return info.compress_type
+
+
+class _LimitedReader(io.RawIOBase):
+    def __init__(self, raw: io.BufferedReader, remaining: int) -> None:
+        self.raw = raw
+        self.remaining = remaining
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b: bytearray) -> int:
+        if self.remaining <= 0:
+            return 0
+        size = min(len(b), self.remaining)
+        data = self.raw.read(size)
+        if not data:
+            return 0
+        n = len(data)
+        b[:n] = data
+        self.remaining -= n
+        return n
+
+
 def convert_zip_member_worker(
     source: Path,
     member_name: str,
@@ -226,16 +305,18 @@ def convert_zip_member_worker(
         dir=temp_parent,
     ) as temp_dir:
         extracted = Path(temp_dir) / Path(member_name).name
-        with zipfile.ZipFile(source) as zf:
-            with zf.open(member_name) as src, extracted.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
-
+        compression_method = extract_zip_member(
+            source,
+            member_name,
+            extracted,
+        )
         result = write_geojson_to_parquet(extracted, target)
 
     return {
         "source_file": source.name,
         "source_member": member_name,
         "output": target.relative_to(output_root).as_posix(),
+        "zip_compression_method": compression_method,
         **result,
     }
 
