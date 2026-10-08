@@ -11,6 +11,7 @@ dependencies = [
   "pyarrow>=18",
   "pyproj>=3.6",
   "rapidgzip>=0.15",
+  "pyogrio>=0.10",
 ]
 
 [project.urls]
@@ -22,6 +23,7 @@ bdnb-parquet = "bdnb_parquet.convert:main"
 bdnb-datasets-audit = "bdnb_parquet.dataset_audit:main"
 bdnb-imope-promote = "bdnb_parquet.imope_promote:main"
 bdnb-promote-parquet = "bdnb_parquet.promote_parquet:main"
+bdnb-vigieau-convert = "bdnb_parquet.vigieau_convert:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
