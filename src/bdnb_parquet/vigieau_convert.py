@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import os
@@ -240,6 +241,18 @@ def convert_geojson_source(
     return results
 
 
+def convert_geojson_source_worker(
+    source: Path,
+    output_root: Path,
+    temp_parent: Path,
+) -> list[dict[str, Any]]:
+    with tempfile.TemporaryDirectory(
+        prefix=f"{slug(source.name)}-",
+        dir=temp_parent,
+    ) as temp_dir:
+        return convert_geojson_source(source, output_root, Path(temp_dir))
+
+
 def convert_csv_files(source_root: Path, output_root: Path) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     candidates = sorted(
@@ -262,7 +275,7 @@ def convert_csv_files(source_root: Path, output_root: Path) -> list[dict[str, An
     return results
 
 
-def convert(source_root: Path, output_root: Path) -> int:
+def convert(source_root: Path, output_root: Path, *, workers: int) -> int:
     source_root = source_root.expanduser().resolve()
     output_root = output_root.expanduser().resolve()
 
@@ -285,10 +298,46 @@ def convert(source_root: Path, output_root: Path) -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="vigieau-", dir=staging) as temp_dir:
             temp_root = Path(temp_dir)
-            for archive in geo_archives:
-                manifest.extend(
-                    convert_geojson_source(archive, staging, temp_root)
-                )
+
+            if workers == 1:
+                for archive in geo_archives:
+                    manifest.extend(
+                        convert_geojson_source_worker(
+                            archive,
+                            staging,
+                            temp_root,
+                        )
+                    )
+            else:
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=workers
+                ) as executor:
+                    future_to_source = {
+                        executor.submit(
+                            convert_geojson_source_worker,
+                            archive,
+                            staging,
+                            temp_root,
+                        ): archive
+                        for archive in geo_archives
+                    }
+
+                    for future in concurrent.futures.as_completed(
+                        future_to_source
+                    ):
+                        archive = future_to_source[future]
+                        try:
+                            results = future.result()
+                        except Exception as exc:
+                            raise RuntimeError(
+                                f"{archive.name}: conversion failed"
+                            ) from exc
+                        manifest.extend(results)
+                        print(
+                            f"DONE SOURCE {archive.name}: "
+                            f"{len(results)} parquet files",
+                            flush=True,
+                        )
 
         manifest.extend(convert_csv_files(source_root, staging))
 
@@ -303,6 +352,7 @@ def convert(source_root: Path, output_root: Path) -> int:
             "bytes": sum(int(item["bytes"]) for item in manifest),
             "geo_files": sum(bool(item["geo"]) for item in manifest),
             "pmtiles_policy": "kept in raw; not converted to Parquet",
+            "workers": workers,
         }
         atomic_json(staging / "manifest.json", manifest)
         atomic_json(staging / "dataset.json", dataset)
@@ -327,13 +377,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(3, os.cpu_count() or 1),
+        help=(
+            "Parallel GeoJSON source workers; default=min(3, CPU count). "
+            "Use 1 for sequential conversion."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.workers <= 0:
+        parser.error("--workers must be positive")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        return convert(args.source, args.output)
+        return convert(args.source, args.output, workers=args.workers)
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
