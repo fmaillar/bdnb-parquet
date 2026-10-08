@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 import zipfile
 from collections import Counter
@@ -514,6 +515,7 @@ class Migrator:
         self.log_path = log_path
         self.max_depth = max_depth
         self.temp_root = self.root / ".migration-tmp"
+        self.worker_log_root = self.root / ".migration-worker-logs"
         self.counts: Counter[str] = Counter()
 
     def log(self, **record: Any) -> None:
@@ -860,7 +862,106 @@ class Migrator:
         print("PRECHECK OK", flush=True)
         return 0
 
-    def run(self) -> int:
+    def parallel_candidate(self, src: Path) -> bool:
+        kind = suffix_kind(src)
+        if kind in {
+            "parquet", "csv", "tsv", "csv.gz", "json", "json.gz",
+            "geojson", "kml", "shapefile", "gpkg", "sqlite",
+            "xlsx", "xls", "ods", "zip",
+        }:
+            return True
+        return kind == "unknown" and src.suffix == ""
+
+    def merge_worker_log(self, path: Path) -> None:
+        if not path.exists():
+            return
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        self.log(
+                            status="failed",
+                            source=str(path),
+                            error="invalid JSONL record from worker",
+                        )
+                        continue
+                    self.log(**record)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def run_parallel(self, files: list[Path], workers: int) -> None:
+        self.worker_log_root.mkdir(parents=True, exist_ok=True)
+        pending = list(files)
+        active: dict[subprocess.Popen[Any], tuple[Path, Path]] = {}
+        completed = 0
+        total = len(files)
+
+        while pending or active:
+            while pending and len(active) < workers:
+                src = pending.pop(0)
+                if not self.parallel_candidate(src):
+                    self.migrate_file(src)
+                    completed += 1
+                    if completed == 1 or completed % 25 == 0:
+                        print(f"[{completed}/{total}] completed", flush=True)
+                    continue
+
+                token = hashlib.sha256(
+                    str(src).encode("utf-8", errors="surrogatepass")
+                ).hexdigest()[:16]
+                worker_log = self.worker_log_root / f"{token}.jsonl"
+                worker_log.unlink(missing_ok=True)
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "bdnb_parquet.overnight_migrate",
+                    "--root",
+                    str(self.root),
+                    "--log",
+                    str(worker_log),
+                    "--max-depth",
+                    str(self.max_depth),
+                    "--worker-file",
+                    str(src),
+                ]
+                proc = subprocess.Popen(cmd)
+                active[proc] = (src, worker_log)
+
+            if not active:
+                continue
+
+            finished: list[subprocess.Popen[Any]] = []
+            for proc, (src, worker_log) in active.items():
+                rc = proc.poll()
+                if rc is None:
+                    continue
+                finished.append(proc)
+                self.merge_worker_log(worker_log)
+                if rc != 0:
+                    self.log(
+                        status="failed",
+                        source=str(src),
+                        error=f"isolated worker exited with status {rc}",
+                    )
+                completed += 1
+                print(
+                    f"[{completed}/{total}] {src.relative_to(self.raw_root)} "
+                    f"(worker exit {rc})",
+                    flush=True,
+                )
+
+            for proc in finished:
+                active.pop(proc, None)
+
+            if not finished:
+                time.sleep(0.25)
+
+    def run(self, *, workers: int = 1) -> int:
         if not self.raw_root.exists():
             raise FileNotFoundError(self.raw_root)
         self.parquet_root.mkdir(parents=True, exist_ok=True)
@@ -878,23 +979,24 @@ class Migrator:
                 files.append(base / filename)
 
         total = len(files)
-        print(f"QUEUE: {total} raw files", flush=True)
-        for idx, src in enumerate(files, start=1):
-            if idx == 1 or idx % 25 == 0:
-                print(f"[{idx}/{total}] {src.relative_to(self.raw_root)}", flush=True)
-            try:
-                self.migrate_file(src)
-            except KeyboardInterrupt:
-                raise
-            except Exception as exc:
-                # Last-resort per-file isolation boundary. Process-level events
-                # such as SystemExit and KeyboardInterrupt are not swallowed.
-                self.log(
-                    status="failed",
-                    source=str(src),
-                    error=f"top-level {type(exc).__name__}: {exc}",
-                    traceback=traceback.format_exc(limit=8),
-                )
+        print(f"QUEUE: {total} raw files; workers={workers}", flush=True)
+        if workers > 1:
+            self.run_parallel(files, workers)
+        else:
+            for idx, src in enumerate(files, start=1):
+                if idx == 1 or idx % 25 == 0:
+                    print(f"[{idx}/{total}] {src.relative_to(self.raw_root)}", flush=True)
+                try:
+                    self.migrate_file(src)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    self.log(
+                        status="failed",
+                        source=str(src),
+                        error=f"top-level {type(exc).__name__}: {exc}",
+                        traceback=traceback.format_exc(limit=8),
+                    )
 
         summary = {
             "created_at": utc_now(),
@@ -920,20 +1022,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-depth", type=int, default=4)
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="isolated concurrent conversion processes; use 3 on HDD-backed m710s",
+    )
+    parser.add_argument(
+        "--worker-file",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--preflight",
         action="store_true",
         help="validate queue, destinations, ZIP metadata and dependencies without converting",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.workers <= 0:
+        parser.error("--workers must be positive")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         migrator = Migrator(args.root, log_path=args.log, max_depth=args.max_depth)
+        if args.worker_file is not None:
+            migrator.migrate_file(args.worker_file.resolve())
+            return 0
         if args.preflight:
             return migrator.preflight()
-        return migrator.run()
+        return migrator.run(workers=args.workers)
     except KeyboardInterrupt:
         print("Interrupted safely; rerun the same command to resume.", file=sys.stderr)
         return 130
