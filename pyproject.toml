@@ -12,6 +12,7 @@ dependencies = [
   "pyproj>=3.6",
   "rapidgzip>=0.15",
   "pyogrio>=0.10",
+  "zstandard>=0.23",
 ]
 
 [project.urls]
