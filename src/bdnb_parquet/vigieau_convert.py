@@ -186,71 +186,112 @@ def write_csv_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
     }
 
 
+def convert_zip_member_worker(
+    source: Path,
+    member_name: str,
+    output_root: Path,
+    temp_parent: Path,
+) -> dict[str, Any]:
+    source_dir = output_root / "geojson" / slug(source.name)
+    with tempfile.TemporaryDirectory(
+        prefix="member-",
+        dir=temp_parent,
+    ) as temp_dir:
+        extracted = Path(temp_dir) / Path(member_name).name
+        with zipfile.ZipFile(source) as zf:
+            with zf.open(member_name) as src, extracted.open("wb") as dst:
+                shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
+
+        target = source_dir / (Path(member_name).stem + ".parquet")
+        result = write_geojson_to_parquet(extracted, target)
+
+    return {
+        "source_file": source.name,
+        "source_member": member_name,
+        "output": target.relative_to(output_root).as_posix(),
+        **result,
+    }
+
+
 def convert_geojson_source(
     source: Path,
     output_root: Path,
     temp_root: Path,
+    *,
+    workers: int,
 ) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
     source_dir = output_root / "geojson" / slug(source.name)
 
     if zipfile.is_zipfile(source):
         with zipfile.ZipFile(source) as zf:
-            members = [
-                info for info in zf.infolist()
+            members = sorted(
+                info.filename
+                for info in zf.infolist()
                 if not info.is_dir() and info.filename.lower().endswith(".geojson")
-            ]
-            if not members:
-                raise RuntimeError(f"No GeoJSON members in {source}")
+            )
+        if not members:
+            raise RuntimeError(f"No GeoJSON members in {source}")
 
-            for index, info in enumerate(members, start=1):
-                extracted = temp_root / Path(info.filename).name
-                with zf.open(info) as src, extracted.open("wb") as dst:
-                    shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
-
-                target = source_dir / (Path(info.filename).stem + ".parquet")
-                result = write_geojson_to_parquet(extracted, target)
-                extracted.unlink()
-
-                results.append(
-                    {
-                        "source_file": source.name,
-                        "source_member": info.filename,
-                        "output": target.relative_to(output_root).as_posix(),
-                        **result,
-                    }
+        results: list[dict[str, Any]] = []
+        if workers == 1:
+            for index, member_name in enumerate(members, start=1):
+                result = convert_zip_member_worker(
+                    source,
+                    member_name,
+                    output_root,
+                    temp_root,
                 )
+                results.append(result)
                 print(
                     f"{source.name}: [{index}/{len(members)}] "
                     f"{result['rows']:,} rows",
                     flush=True,
                 )
+        else:
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=workers
+            ) as executor:
+                future_to_member = {
+                    executor.submit(
+                        convert_zip_member_worker,
+                        source,
+                        member_name,
+                        output_root,
+                        temp_root,
+                    ): member_name
+                    for member_name in members
+                }
+                done = 0
+                for future in concurrent.futures.as_completed(future_to_member):
+                    member_name = future_to_member[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"{source.name}/{member_name}: conversion failed"
+                        ) from exc
+                    results.append(result)
+                    done += 1
+                    print(
+                        f"{source.name}: [{done}/{len(members)}] "
+                        f"{result['rows']:,} rows",
+                        flush=True,
+                    )
+
+        results.sort(key=lambda item: str(item["source_member"]))
         return results
 
     target = source_dir / (slug(source.name) + ".parquet")
     result = write_geojson_to_parquet(source, target)
-    results.append(
+    print(f"{source.name}: {result['rows']:,} rows", flush=True)
+    return [
         {
             "source_file": source.name,
             "source_member": "",
             "output": target.relative_to(output_root).as_posix(),
             **result,
         }
-    )
-    print(f"{source.name}: {result['rows']:,} rows", flush=True)
-    return results
-
-
-def convert_geojson_source_worker(
-    source: Path,
-    output_root: Path,
-    temp_parent: Path,
-) -> list[dict[str, Any]]:
-    with tempfile.TemporaryDirectory(
-        prefix=f"{slug(source.name)}-",
-        dir=temp_parent,
-    ) as temp_dir:
-        return convert_geojson_source(source, output_root, Path(temp_dir))
+    ]
 
 
 def convert_csv_files(source_root: Path, output_root: Path) -> list[dict[str, Any]]:
@@ -299,45 +340,19 @@ def convert(source_root: Path, output_root: Path, *, workers: int) -> int:
         with tempfile.TemporaryDirectory(prefix="vigieau-", dir=staging) as temp_dir:
             temp_root = Path(temp_dir)
 
-            if workers == 1:
-                for archive in geo_archives:
-                    manifest.extend(
-                        convert_geojson_source_worker(
-                            archive,
-                            staging,
-                            temp_root,
-                        )
-                    )
-            else:
-                with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=workers
-                ) as executor:
-                    future_to_source = {
-                        executor.submit(
-                            convert_geojson_source_worker,
-                            archive,
-                            staging,
-                            temp_root,
-                        ): archive
-                        for archive in geo_archives
-                    }
-
-                    for future in concurrent.futures.as_completed(
-                        future_to_source
-                    ):
-                        archive = future_to_source[future]
-                        try:
-                            results = future.result()
-                        except Exception as exc:
-                            raise RuntimeError(
-                                f"{archive.name}: conversion failed"
-                            ) from exc
-                        manifest.extend(results)
-                        print(
-                            f"DONE SOURCE {archive.name}: "
-                            f"{len(results)} parquet files",
-                            flush=True,
-                        )
+            for archive in geo_archives:
+                results = convert_geojson_source(
+                    archive,
+                    staging,
+                    temp_root,
+                    workers=workers,
+                )
+                manifest.extend(results)
+                print(
+                    f"DONE SOURCE {archive.name}: "
+                    f"{len(results)} parquet files",
+                    flush=True,
+                )
 
         manifest.extend(convert_csv_files(source_root, staging))
 
@@ -382,8 +397,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=min(3, os.cpu_count() or 1),
         help=(
-            "Parallel GeoJSON source workers; default=min(3, CPU count). "
-            "Use 1 for sequential conversion."
+            "Parallel GeoJSON members within each ZIP archive; "
+            "default=min(3, CPU count). Use 1 for sequential conversion."
         ),
     )
     args = parser.parse_args(argv)
