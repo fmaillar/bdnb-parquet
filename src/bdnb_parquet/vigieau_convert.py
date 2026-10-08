@@ -136,6 +136,23 @@ def write_geojson_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
     }
 
 
+def existing_parquet_result(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        pf = pq.ParquetFile(path)
+        metadata = pf.schema_arrow.metadata or {}
+        return {
+            "rows": pf.metadata.num_rows,
+            "row_groups": pf.metadata.num_row_groups,
+            "bytes": path.stat().st_size,
+            "geo": b"geo" in metadata,
+        }
+    except Exception:
+        path.unlink(missing_ok=True)
+        return None
+
+
 def write_csv_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
     dst.parent.mkdir(parents=True, exist_ok=True)
 
@@ -193,6 +210,17 @@ def convert_zip_member_worker(
     temp_parent: Path,
 ) -> dict[str, Any]:
     source_dir = output_root / "geojson" / slug(source.name)
+    target = source_dir / (Path(member_name).stem + ".parquet")
+    existing = existing_parquet_result(target)
+    if existing is not None:
+        return {
+            "source_file": source.name,
+            "source_member": member_name,
+            "output": target.relative_to(output_root).as_posix(),
+            "resumed": True,
+            **existing,
+        }
+
     with tempfile.TemporaryDirectory(
         prefix="member-",
         dir=temp_parent,
@@ -202,7 +230,6 @@ def convert_zip_member_worker(
             with zf.open(member_name) as src, extracted.open("wb") as dst:
                 shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
 
-        target = source_dir / (Path(member_name).stem + ".parquet")
         result = write_geojson_to_parquet(extracted, target)
 
     return {
@@ -244,6 +271,7 @@ def convert_geojson_source(
                 results.append(result)
                 print(
                     f"{source.name}: [{index}/{len(members)}] "
+                    f"{'SKIP ' if result.get('resumed') else ''}"
                     f"{result['rows']:,} rows",
                     flush=True,
                 )
@@ -275,6 +303,7 @@ def convert_geojson_source(
                     done += 1
                     print(
                         f"{source.name}: [{done}/{len(members)}] "
+                        f"{'SKIP ' if result.get('resumed') else ''}"
                         f"{result['rows']:,} rows",
                         flush=True,
                     )
@@ -283,13 +312,20 @@ def convert_geojson_source(
         return results
 
     target = source_dir / (slug(source.name) + ".parquet")
-    result = write_geojson_to_parquet(source, target)
-    print(f"{source.name}: {result['rows']:,} rows", flush=True)
+    result = existing_parquet_result(target)
+    resumed = result is not None
+    if result is None:
+        result = write_geojson_to_parquet(source, target)
+    print(
+        f"{source.name}: {'SKIP ' if resumed else ''}{result['rows']:,} rows",
+        flush=True,
+    )
     return [
         {
             "source_file": source.name,
             "source_member": "",
             "output": target.relative_to(output_root).as_posix(),
+            "resumed": resumed,
             **result,
         }
     ]
@@ -327,9 +363,7 @@ def convert(source_root: Path, output_root: Path, *, workers: int) -> int:
         raise RuntimeError(f"Output already exists: {output_root}")
 
     staging = output_root.with_name(output_root.name + ".staging")
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True)
+    staging.mkdir(parents=True, exist_ok=True)
 
     geo_archives = sorted(
         p for p in source_root.iterdir()
@@ -374,8 +408,11 @@ def convert(source_root: Path, output_root: Path, *, workers: int) -> int:
         atomic_json(staging / "dataset.json", dataset)
         os.replace(staging, output_root)
     except Exception:
-        if staging.exists():
-            shutil.rmtree(staging)
+        print(
+            f"Staging preserved for resume: {staging}",
+            file=sys.stderr,
+            flush=True,
+        )
         raise
 
     print(
