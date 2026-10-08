@@ -157,44 +157,58 @@ def write_csv_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
     }
 
 
-def convert_geojson_archive(
-    archive: Path,
+def convert_geojson_source(
+    source: Path,
     output_root: Path,
     temp_root: Path,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    archive_dir = output_root / "geojson" / slug(archive.name)
+    source_dir = output_root / "geojson" / slug(source.name)
 
-    with zipfile.ZipFile(archive) as zf:
-        members = [
-            info for info in zf.infolist()
-            if not info.is_dir() and info.filename.lower().endswith(".geojson")
-        ]
-        if not members:
-            raise RuntimeError(f"No GeoJSON members in {archive}")
+    if zipfile.is_zipfile(source):
+        with zipfile.ZipFile(source) as zf:
+            members = [
+                info for info in zf.infolist()
+                if not info.is_dir() and info.filename.lower().endswith(".geojson")
+            ]
+            if not members:
+                raise RuntimeError(f"No GeoJSON members in {source}")
 
-        for index, info in enumerate(members, start=1):
-            extracted = temp_root / Path(info.filename).name
-            with zf.open(info) as src, extracted.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
+            for index, info in enumerate(members, start=1):
+                extracted = temp_root / Path(info.filename).name
+                with zf.open(info) as src, extracted.open("wb") as dst:
+                    shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
 
-            target = archive_dir / (Path(info.filename).stem + ".parquet")
-            result = write_geojson_to_parquet(extracted, target)
-            extracted.unlink()
+                target = source_dir / (Path(info.filename).stem + ".parquet")
+                result = write_geojson_to_parquet(extracted, target)
+                extracted.unlink()
 
-            record = {
-                "source_archive": archive.name,
-                "source_member": info.filename,
-                "output": target.relative_to(output_root).as_posix(),
-                **result,
-            }
-            results.append(record)
-            print(
-                f"{archive.name}: [{index}/{len(members)}] "
-                f"{result['rows']:,} rows",
-                flush=True,
-            )
+                results.append(
+                    {
+                        "source_file": source.name,
+                        "source_member": info.filename,
+                        "output": target.relative_to(output_root).as_posix(),
+                        **result,
+                    }
+                )
+                print(
+                    f"{source.name}: [{index}/{len(members)}] "
+                    f"{result['rows']:,} rows",
+                    flush=True,
+                )
+        return results
 
+    target = source_dir / (slug(source.name) + ".parquet")
+    result = write_geojson_to_parquet(source, target)
+    results.append(
+        {
+            "source_file": source.name,
+            "source_member": "",
+            "output": target.relative_to(output_root).as_posix(),
+            **result,
+        }
+    )
+    print(f"{source.name}: {result['rows']:,} rows", flush=True)
     return results
 
 
@@ -245,7 +259,7 @@ def convert(source_root: Path, output_root: Path) -> int:
             temp_root = Path(temp_dir)
             for archive in geo_archives:
                 manifest.extend(
-                    convert_geojson_archive(archive, staging, temp_root)
+                    convert_geojson_source(archive, staging, temp_root)
                 )
 
         manifest.extend(convert_csv_files(source_root, staging))
