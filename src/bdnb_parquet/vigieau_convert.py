@@ -71,29 +71,57 @@ def write_geojson_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
         meta, reader = source
         geometry_name = meta.get("geometry_name") or "wkb_geometry"
         writer: pq.ParquetWriter | None = None
+        schema: pa.Schema | None = None
+
         try:
             for batch in reader:
                 metadata = dict(batch.schema.metadata or {})
                 metadata[b"geo"] = geo_metadata(meta, geometry_name)
                 batch = batch.replace_schema_metadata(metadata)
+                schema = batch.schema
+
                 if writer is None:
                     writer = pq.ParquetWriter(
                         dst,
-                        batch.schema,
+                        schema,
                         compression="zstd",
                         compression_level=3,
                         use_dictionary=True,
                         write_statistics=True,
                     )
-                writer.write_batch(batch)
-                rows += batch.num_rows
-                row_groups += 1
+
+                if batch.num_rows:
+                    writer.write_batch(batch)
+                    rows += batch.num_rows
+                    row_groups += 1
         finally:
             if writer is not None:
                 writer.close()
 
-    if writer is None:
-        raise RuntimeError(f"No rows read from GeoJSON: {src}")
+        if schema is None:
+            # pyogrio may yield no batches for an empty layer. Obtain the Arrow
+            # schema directly from the reader and materialize a typed empty table.
+            schema = reader.schema
+            metadata = dict(schema.metadata or {})
+            metadata[b"geo"] = geo_metadata(meta, geometry_name)
+            schema = schema.with_metadata(metadata)
+            pq.write_table(
+                pa.Table.from_batches([], schema=schema),
+                dst,
+                compression="zstd",
+                compression_level=3,
+                use_dictionary=True,
+                write_statistics=True,
+            )
+        elif writer is None:
+            pq.write_table(
+                pa.Table.from_batches([], schema=schema),
+                dst,
+                compression="zstd",
+                compression_level=3,
+                use_dictionary=True,
+                write_statistics=True,
+            )
 
     pf = pq.ParquetFile(dst)
     if pf.metadata.num_rows != rows:
