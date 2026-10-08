@@ -13,6 +13,10 @@ dependencies = [
   "rapidgzip>=0.15",
   "pyogrio>=0.10",
   "zstandard>=0.23",
+  "odfpy>=1.4",
+  "xlrd>=2.0",
+  "openpyxl>=3.1",
+  "pandas>=2.2",
 ]
 
 [project.urls]
@@ -26,6 +30,7 @@ bdnb-imope-promote = "bdnb_parquet.imope_promote:main"
 bdnb-promote-parquet = "bdnb_parquet.promote_parquet:main"
 bdnb-vigieau-convert = "bdnb_parquet.vigieau_convert:main"
 bdnb-datatourisme-convert = "bdnb_parquet.datatourisme_convert:main"
+bdnb-overnight-migrate = "bdnb_parquet.overnight_migrate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
