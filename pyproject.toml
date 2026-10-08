@@ -19,6 +19,7 @@ Issues = "https://github.com/fmaillar/bdnb-parquet/issues"
 
 [project.scripts]
 bdnb-parquet = "bdnb_parquet.convert:main"
+bdnb-datasets-audit = "bdnb_parquet.dataset_audit:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
