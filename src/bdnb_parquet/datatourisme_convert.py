@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
 import io
 import json
 import os
@@ -266,13 +267,33 @@ def convert_csv_file(source: Path, output_root: Path) -> dict[str, Any]:
     tmp = target.with_suffix(target.suffix + ".tmp")
     tmp.unlink(missing_ok=True)
 
+    with source.open(
+        "r",
+        encoding="utf-8-sig",
+        errors="strict",
+        newline="",
+    ) as header_stream:
+        header = next(csv.reader(header_stream))
+
+    if not header:
+        raise RuntimeError(f"CSV has no header: {source}")
+
+    column_types = {
+        name: pa.string()
+        for name in header
+    }
+
     reader = pacsv.open_csv(
         source,
-        read_options=pacsv.ReadOptions(block_size=16 * 1024 * 1024),
+        read_options=pacsv.ReadOptions(
+            block_size=16 * 1024 * 1024,
+            encoding="utf8",
+        ),
         parse_options=pacsv.ParseOptions(
             newlines_in_values=True,
         ),
         convert_options=pacsv.ConvertOptions(
+            column_types=column_types,
             strings_can_be_null=True,
             null_values=["", "null", "NULL"],
         ),
