@@ -335,6 +335,10 @@ def write_geo(src: Path, dst: Path, *, layer: str | None = None) -> dict[str, An
     kwargs: dict[str, Any] = {"use_pyarrow": True, "batch_size": 65_536}
     if layer is not None:
         kwargs["layer"] = layer
+    if suffix_kind(src) == "shapefile":
+        # Legacy French shapefiles frequently carry CP1252 DBF strings
+        # without a reliable .cpg declaration.
+        kwargs["encoding"] = "CP1252"
 
     source_path: str | Path = src
     alias_dir: tempfile.TemporaryDirectory[str] | None = None
@@ -348,15 +352,7 @@ def write_geo(src: Path, dst: Path, *, layer: str | None = None) -> dict[str, An
             source_path = alias
 
     try:
-        try:
-            source_ctx = open_arrow(source_path, **kwargs)
-        except UnicodeDecodeError:
-            if suffix_kind(src) != "shapefile":
-                raise
-            kwargs["encoding"] = "CP1252"
-            source_ctx = open_arrow(source_path, **kwargs)
-
-        with source_ctx as source:
+        with open_arrow(source_path, **kwargs) as source:
             meta, reader = source
             geometry_name = meta.get("geometry_name") or "wkb_geometry"
             for batch in reader:
@@ -1082,55 +1078,62 @@ def spreadsheet_to_parquet(src: Path, dst_dir: Path) -> list[dict[str, Any]]:
     engine = spreadsheet_engine(src)
     if engine is None:
         with src.open("rb") as fh:
-            head = fh.read(256 * 1024)
-        stripped = head.lstrip()
-        lower = stripped.lower()
+            head = fh.read(2 * 1024 * 1024)
 
-        # A number of public-sector ".xls" resources are actually
-        # SpreadsheetML XML, HTML tables, or delimited text exports.
-        if (
-            b"urn:schemas-microsoft-com:office:spreadsheet" in lower
-            or b"<workbook" in lower
-        ):
-            target = dst_dir / "sheet1.parquet"
-            info = spreadsheetml_to_parquet(src, target)
-            return [{"sheet": "sheet1", "path": str(target), **info}]
+        decoded: list[tuple[str, str]] = []
+        for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "cp1252"):
+            try:
+                text = head.decode(encoding, errors="strict")
+            except UnicodeError:
+                continue
+            decoded.append((encoding, text))
+            lower_text = text.lstrip().lower()
 
-        if b"<html" in lower or b"<table" in lower:
-            frames = pd.read_html(src, dtype_backend="numpy_nullable")
-            results: list[dict[str, Any]] = []
-            for index, frame in enumerate(frames, start=1):
-                target = dst_dir / f"table-{index}.parquet"
-                table = pa.Table.from_pandas(frame.astype(str), preserve_index=False)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                tmp = target.with_suffix(".parquet.tmp")
-                pq.write_table(table, tmp, compression="zstd", compression_level=3)
-                info = parquet_valid(tmp)
-                if info is None:
-                    tmp.unlink(missing_ok=True)
-                    raise RuntimeError(
-                        f"invalid HTML-table spreadsheet output: {src} table={index}"
+            if (
+                "urn:schemas-microsoft-com:office:spreadsheet" in lower_text
+                or "<workbook" in lower_text
+            ):
+                target = dst_dir / "sheet1.parquet"
+                info = spreadsheetml_to_parquet(src, target)
+                return [{"sheet": "sheet1", "path": str(target), **info}]
+
+            if "<html" in lower_text or "<table" in lower_text:
+                try:
+                    frames = pd.read_html(io.StringIO(text), dtype_backend="numpy_nullable")
+                except Exception:
+                    frames = []
+                results: list[dict[str, Any]] = []
+                for index, frame in enumerate(frames, start=1):
+                    target = dst_dir / f"table-{index}.parquet"
+                    table = pa.Table.from_pandas(frame.astype(str), preserve_index=False)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = target.with_suffix(".parquet.tmp")
+                    pq.write_table(table, tmp, compression="zstd", compression_level=3)
+                    info = parquet_valid(tmp)
+                    if info is None:
+                        tmp.unlink(missing_ok=True)
+                        raise RuntimeError(
+                            f"invalid HTML-table spreadsheet output: {src} table={index}"
+                        )
+                    os.replace(tmp, target)
+                    results.append(
+                        {"sheet": f"table-{index}", "path": str(target), **info}
                     )
-                os.replace(tmp, target)
-                results.append(
-                    {"sheet": f"table-{index}", "path": str(target), **info}
-                )
-            if results:
-                return results
+                if results:
+                    return results
 
-        # Last-resort legacy export: many historical ".xls" files
-        # are UTF-8/CP1252/UTF-16 delimited text produced for Excel.
-        for encoding in ("utf-8-sig", "utf-16", "cp1252"):
+        # Last-resort legacy export: decode the complete source and treat
+        # it as delimited text if the first non-empty line is tabular.
+        for encoding, _ in decoded:
             try:
                 text = src.read_text(encoding=encoding, errors="strict")
             except (UnicodeError, OSError):
                 continue
-            sample = text[:256 * 1024]
-            first = sample.splitlines()[0] if sample.splitlines() else ""
-            delimiter = max(
-                ("\\t", ";", ",", "|"),
-                key=lambda d: first.count(d),
-            )
+            lines = [line for line in text.splitlines() if line.strip()]
+            if not lines:
+                continue
+            first = lines[0]
+            delimiter = max(("\t", ";", ",", "|"), key=lambda d: first.count(d))
             if first.count(delimiter) < 1:
                 continue
 
