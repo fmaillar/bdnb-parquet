@@ -84,6 +84,20 @@ def main(argv: list[str] | None = None) -> int:
     raw_root = root / "raw"
     logs = [p.expanduser().resolve() for p in args.logs]
 
+    def natural_key(path: Path) -> tuple[object, ...]:
+        import re
+        return tuple(
+            int(part) if part.isdigit() else part
+            for part in re.split(r"(\d+)", path.name)
+        )
+
+    # Preserve the base log first and order passN logs numerically, so pass10
+    # cannot be evaluated before pass2 merely because of lexical glob order.
+    if logs:
+        base = [p for p in logs if "-pass" not in p.name]
+        passes = sorted((p for p in logs if "-pass" in p.name), key=natural_key)
+        logs = base + passes
+
     for p in logs:
         if not p.is_file():
             raise FileNotFoundError(p)
