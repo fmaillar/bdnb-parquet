@@ -33,6 +33,7 @@ bdnb-vigieau-convert = "bdnb_parquet.vigieau_convert:main"
 bdnb-datatourisme-convert = "bdnb_parquet.datatourisme_convert:main"
 bdnb-overnight-migrate = "bdnb_parquet.overnight_migrate:main"
 bdnb-parquet-manifest = "bdnb_parquet.parquet_manifest:main"
+bdnb-reconcile-raw-parquet = "bdnb_parquet.reconcile_raw_parquet:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
