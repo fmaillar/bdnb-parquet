@@ -35,6 +35,7 @@ bdnb-overnight-migrate = "bdnb_parquet.overnight_migrate:main"
 bdnb-parquet-manifest = "bdnb_parquet.parquet_manifest:main"
 bdnb-reconcile-raw-parquet = "bdnb_parquet.reconcile_raw_parquet:main"
 bdnb-build-release = "bdnb_parquet.build_release:main"
+bdnb-semantic-audit = "bdnb_parquet.semantic_audit:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
