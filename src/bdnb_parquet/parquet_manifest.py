@@ -68,6 +68,27 @@ def atomic_json(path: Path, obj: Any) -> None:
     os.replace(tmp, path)
 
 
+def load_manifest(path: Path) -> dict[str, Entry]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    result: dict[str, Entry] = {}
+    with path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            entry = Entry(
+                path=row["path"],
+                bytes=int(row["bytes"]),
+                rows=int(row["rows"]),
+                row_groups=int(row["row_groups"]),
+                columns=int(row["columns"]),
+                schema_hash=row["schema_hash"],
+                partial=row["partial"] in {"1", "true", "True"},
+                sha256=row.get("sha256", ""),
+            )
+            result[entry.path] = entry
+    return result
+
+
 def write_tsv(entries: list[Entry], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -101,21 +122,42 @@ def write_tsv(entries: list[Entry], path: Path) -> None:
     os.replace(tmp, path)
 
 
-def build(root: Path, *, checksum: bool) -> tuple[list[Entry], list[dict[str, str]]]:
+def build(
+    root: Path,
+    *,
+    checksum: bool,
+    reuse: dict[str, Entry] | None = None,
+) -> tuple[list[Entry], list[dict[str, str]], int, int]:
     entries: list[Entry] = []
     errors: list[dict[str, str]] = []
+    reused = 0
+    inspected = 0
 
     for path in sorted(root.rglob("*.parquet")):
+        rel = path.relative_to(root).as_posix()
         try:
+            size = path.stat().st_size
+            previous = reuse.get(rel) if reuse is not None else None
+            can_reuse = (
+                previous is not None
+                and previous.bytes == size
+                and (not checksum or bool(previous.sha256))
+            )
+            if can_reuse:
+                entries.append(previous)
+                reused += 1
+                continue
+
             entries.append(inspect(path, root, checksum=checksum))
+            inspected += 1
         except Exception as exc:
             errors.append(
                 {
-                    "path": path.relative_to(root).as_posix(),
+                    "path": rel,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
-    return entries, errors
+    return entries, errors, reused, inspected
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -127,10 +169,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="compute SHA-256 for every Parquet file; this reads the entire corpus",
     )
+    parser.add_argument(
+        "--reuse",
+        type=Path,
+        help=(
+            "reuse metadata from an existing manifest when relative path and "
+            "file size are unchanged"
+        ),
+    )
     args = parser.parse_args(argv)
 
     root = args.root.expanduser().resolve()
-    entries, errors = build(root, checksum=args.checksum)
+    reuse = load_manifest(args.reuse.expanduser().resolve()) if args.reuse else None
+    entries, errors, reused, inspected = build(
+        root,
+        checksum=args.checksum,
+        reuse=reuse,
+    )
 
     total_bytes = sum(e.bytes for e in entries)
     total_rows = sum(e.rows for e in entries)
@@ -156,6 +211,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print(f"FILES: {len(entries)}")
+    print(f"REUSED: {reused}")
+    print(f"INSPECTED: {inspected}")
     print(f"SIZE: {total_bytes / 2**30:.3f} GiB")
     print(f"ROWS: {total_rows}")
     print(f"PARTIAL: {sum(e.partial for e in entries)}")
