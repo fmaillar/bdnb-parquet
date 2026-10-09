@@ -327,14 +327,91 @@ def write_csv(src: Path, dst: Path, *, gzipped: bool = False) -> dict[str, Any]:
     return info
 
 
+def write_json_array_lossless(
+    src: Path,
+    dst: Path,
+    *,
+    gzipped: bool = False,
+    batch_items: int = 50_000,
+) -> dict[str, Any]:
+    """Stream a top-level JSON array into Parquet without schema assumptions.
+
+    Each array element is stored as compact JSON text in one nullable string
+    column named "json". This is lossless at the JSON data-model level and
+    avoids schema drift failures on heterogeneous objects.
+    """
+    import ijson
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+
+    source: Any = gzip.open(src, "rb") if gzipped else src.open("rb")
+    schema = pa.schema([pa.field("json", pa.string(), nullable=True)])
+    writer = pq.ParquetWriter(
+        tmp,
+        schema,
+        compression="zstd",
+        compression_level=3,
+        use_dictionary=False,
+        write_statistics=True,
+    )
+    rows = 0
+    batch: list[str | None] = []
+
+    def flush() -> None:
+        nonlocal batch
+        if not batch:
+            return
+        table = pa.Table.from_arrays(
+            [pa.array(batch, type=pa.string())],
+            schema=schema,
+        )
+        writer.write_table(
+            table,
+            row_group_size=min(len(batch), 100_000),
+        )
+        batch = []
+
+    try:
+        for item in ijson.items(source, "item"):
+            if item is None:
+                batch.append(None)
+            else:
+                batch.append(
+                    json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=str,
+                    )
+                )
+            rows += 1
+            if len(batch) >= batch_items:
+                flush()
+        flush()
+    finally:
+        writer.close()
+        source.close()
+
+    info = parquet_valid(tmp)
+    if info is None or info["rows"] != rows:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"invalid JSON-array Parquet output for {src}")
+
+    os.replace(tmp, dst)
+    return {
+        **info,
+        "json_layout": "array",
+        "representation": "lossless-json-text",
+    }
+
 def write_json(src: Path, dst: Path, *, gzipped: bool = False) -> dict[str, Any]:
     import pyarrow.json as pajson
 
     layout = json_layout(src, gzipped=gzipped)
     if layout == "array":
-        raise RuntimeError(
-            "top-level JSON arrays are deferred; streaming NDJSON/object records only"
-        )
+        return write_json_array_lossless(src, dst, gzipped=gzipped)
     if layout in {"empty", "unknown"}:
         raise RuntimeError(f"unsupported JSON layout: {layout}")
 
