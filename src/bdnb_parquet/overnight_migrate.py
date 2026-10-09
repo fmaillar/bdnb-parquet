@@ -1044,7 +1044,7 @@ def spreadsheet_engine(src: Path) -> str | None:
     with src.open("rb") as fh:
         head = fh.read(4096)
     if head.startswith(b"PK\\x03\\x04"):
-        return "openpyxl"
+        return "odf" if src.suffix.lower() == ".ods" else "openpyxl"
     if head.startswith(bytes.fromhex("D0CF11E0A1B11AE1")):
         return "xlrd"
     stripped = head.lstrip().lower()
@@ -1060,6 +1060,56 @@ def spreadsheet_to_parquet(src: Path, dst_dir: Path) -> list[dict[str, Any]]:
 
     engine = spreadsheet_engine(src)
     if engine is None:
+        with src.open("rb") as fh:
+            head = fh.read(256 * 1024)
+        stripped = head.lstrip()
+        lower = stripped.lower()
+
+        # A number of public-sector ".xls" resources are actually
+        # SpreadsheetML XML, HTML tables, or delimited text exports.
+        if (
+            lower.startswith(b"<?xml")
+            and (
+                b"urn:schemas-microsoft-com:office:spreadsheet" in lower
+                or b"<workbook" in lower
+            )
+        ):
+            target = dst_dir / "sheet1.parquet"
+            info = spreadsheetml_to_parquet(src, target)
+            return [{"sheet": "sheet1", "path": str(target), **info}]
+
+        if lower.startswith(b"<html") or lower.startswith(b"<!doctype html"):
+            frames = pd.read_html(src, dtype_backend="numpy_nullable")
+            results: list[dict[str, Any]] = []
+            for index, frame in enumerate(frames, start=1):
+                target = dst_dir / f"table-{index}.parquet"
+                table = pa.Table.from_pandas(frame.astype(str), preserve_index=False)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_suffix(".parquet.tmp")
+                pq.write_table(table, tmp, compression="zstd", compression_level=3)
+                info = parquet_valid(tmp)
+                if info is None:
+                    tmp.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"invalid HTML-table spreadsheet output: {src} table={index}"
+                    )
+                os.replace(tmp, target)
+                results.append(
+                    {"sheet": f"table-{index}", "path": str(target), **info}
+                )
+            if results:
+                return results
+
+        # Last-resort legacy export: try it as delimited text.
+        try:
+            header, delimiter = csv_header_and_delimiter(src)
+            if len(header) >= 2 and delimiter in {",", ";", "\\t", "|"}:
+                target = dst_dir / "sheet1.parquet"
+                info = write_csv(src, target)
+                return [{"sheet": "sheet1", "path": str(target), **info}]
+        except Exception:
+            pass
+
         raise RuntimeError(
             f"spreadsheet extension does not match a supported Excel container: {src}"
         )
@@ -1139,6 +1189,8 @@ def safe_zip_members(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
             continue
         p = Path(info.filename)
         if p.is_absolute() or ".." in p.parts:
+            continue
+        if "__MACOSX" in p.parts or p.name.startswith("._"):
             continue
         result.append(info)
     return result
@@ -1536,6 +1588,9 @@ class Migrator:
                 ) as td:
                     extracted = extract_with_7zip(src, Path(td))
                     for member in extracted:
+                        rel_member = member.relative_to(td)
+                        if "__MACOSX" in rel_member.parts or member.name.startswith("._"):
+                            continue
                         if member.suffix.lower() in {
                             ".dbf", ".shx", ".sbn", ".sbx", ".prj", ".cpg",
                             ".qml", ".pdf", ".tif", ".tiff",
