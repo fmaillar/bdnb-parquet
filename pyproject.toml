@@ -38,6 +38,7 @@ bdnb-build-release = "bdnb_parquet.build_release:main"
 bdnb-semantic-audit = "bdnb_parquet.semantic_audit:main"
 bdnb-normalize-layout = "bdnb_parquet.normalize_layout:main"
 bdnb-build-snapshot-index = "bdnb_parquet.snapshot_index:main"
+bdnb-normalize-rna = "bdnb_parquet.normalize_rna:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
