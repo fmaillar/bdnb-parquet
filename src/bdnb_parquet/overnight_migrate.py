@@ -762,8 +762,13 @@ def extract_zip(src: Path, temp: Path) -> list[Path]:
 
 
 
-def retry_sources_from_log(log_path: Path, raw_root: Path) -> list[Path]:
-    """Return existing top-level raw sources whose latest log state needs retry."""
+def retry_sources_from_log(
+    log_path: Path,
+    raw_root: Path,
+    *,
+    statuses: set[str],
+) -> list[Path]:
+    """Return existing top-level raw sources whose latest status is selected."""
     latest: dict[str, str] = {}
     raw_prefix = str(raw_root.resolve()) + os.sep
 
@@ -792,7 +797,7 @@ def retry_sources_from_log(log_path: Path, raw_root: Path) -> list[Path]:
     selected: list[Path] = []
     missing: list[str] = []
     for source, status in latest.items():
-        if status not in {"failed", "partial"}:
+        if status not in statuses:
             continue
         path = Path(source)
         if path.is_file():
@@ -802,7 +807,7 @@ def retry_sources_from_log(log_path: Path, raw_root: Path) -> list[Path]:
 
     if missing:
         print(
-            f"RETRY: {len(missing)} failed/partial sources no longer exist; skipped",
+            f"RETRY: {len(missing)} selected sources no longer exist; skipped",
             file=sys.stderr,
             flush=True,
         )
@@ -1363,9 +1368,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--retry-from-log",
         type=Path,
+        help="build a targeted retry queue from latest source statuses in this JSONL log",
+    )
+    parser.add_argument(
+        "--retry-status",
+        action="append",
+        choices=("failed", "partial"),
         help=(
-            "retry only top-level raw sources whose latest status in this JSONL "
-            "log is failed or partial"
+            "status to retry from --retry-from-log; may be repeated; "
+            "defaults to failed+partial"
         ),
     )
     parser.add_argument(
@@ -1402,9 +1413,15 @@ def main(argv: list[str] | None = None) -> int:
             retry_log = args.retry_from_log.expanduser().resolve()
             if not retry_log.is_file():
                 raise FileNotFoundError(retry_log)
-            retry_files = retry_sources_from_log(retry_log, migrator.raw_root)
+            retry_statuses = set(args.retry_status or ("failed", "partial"))
+            retry_files = retry_sources_from_log(
+                retry_log,
+                migrator.raw_root,
+                statuses=retry_statuses,
+            )
             print(
-                f"RETRY: selected {len(retry_files)} raw sources from {retry_log}",
+                f"RETRY: selected {len(retry_files)} raw sources "
+                f"with status={','.join(sorted(retry_statuses))} from {retry_log}",
                 flush=True,
             )
         return migrator.run(workers=args.workers, files=retry_files)
