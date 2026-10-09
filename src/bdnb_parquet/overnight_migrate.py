@@ -151,6 +151,8 @@ def suffix_kind(path: Path) -> str:
         return "zip"
     if path.suffix.lower() == ".7z":
         return "7z"
+    if path.suffix.lower() in SKIP_SUFFIXES:
+        return "non-tabular"
     return magic_kind(path)
 
 
@@ -334,11 +336,11 @@ def write_json_array_lossless(
     gzipped: bool = False,
     batch_items: int = 50_000,
 ) -> dict[str, Any]:
-    """Stream a top-level JSON array into Parquet without schema assumptions.
+    """Stream a top-level JSON array losslessly, salvaging complete elements.
 
-    Each array element is stored as compact JSON text in one nullable string
-    column named "json". This is lossless at the JSON data-model level and
-    avoids schema drift failures on heterogeneous objects.
+    A truncated source is never published as the canonical destination. Complete
+    elements parsed before the error are written to ``*.partial.parquet`` and
+    accompanied by a JSON sidecar describing the parse failure.
     """
     import ijson
 
@@ -358,6 +360,7 @@ def write_json_array_lossless(
     )
     rows = 0
     batch: list[str | None] = []
+    parse_error: Exception | None = None
 
     def flush() -> None:
         nonlocal batch
@@ -374,21 +377,24 @@ def write_json_array_lossless(
         batch = []
 
     try:
-        for item in ijson.items(source, "item"):
-            if item is None:
-                batch.append(None)
-            else:
-                batch.append(
-                    json.dumps(
-                        item,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        default=str,
+        try:
+            for item in ijson.items(source, "item"):
+                if item is None:
+                    batch.append(None)
+                else:
+                    batch.append(
+                        json.dumps(
+                            item,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            default=str,
+                        )
                     )
-                )
-            rows += 1
-            if len(batch) >= batch_items:
-                flush()
+                rows += 1
+                if len(batch) >= batch_items:
+                    flush()
+        except ijson.JSONError as exc:
+            parse_error = exc
         flush()
     finally:
         writer.close()
@@ -399,9 +405,33 @@ def write_json_array_lossless(
         tmp.unlink(missing_ok=True)
         raise RuntimeError(f"invalid JSON-array Parquet output for {src}")
 
-    os.replace(tmp, dst)
+    if parse_error is None:
+        os.replace(tmp, dst)
+        return {
+            **info,
+            "json_layout": "array",
+            "representation": "lossless-json-text",
+        }
+
+    partial = dst.with_suffix(".partial.parquet")
+    sidecar = dst.with_suffix(".partial.json")
+    os.replace(tmp, partial)
+    atomic_json(
+        sidecar,
+        {
+            "status": "partial",
+            "source": str(src),
+            "output": str(partial),
+            "rows_recovered": rows,
+            "error": f"{type(parse_error).__name__}: {parse_error}",
+            "created_at": utc_now(),
+        },
+    )
     return {
         **info,
+        "partial": True,
+        "partial_output": str(partial),
+        "error": f"{type(parse_error).__name__}: {parse_error}",
         "json_layout": "array",
         "representation": "lossless-json-text",
     }
@@ -674,7 +704,19 @@ class Migrator:
                     self.log(status="skip", source=str(src), output=str(target), kind=kind)
                     return
                 info = write_json(src, target, gzipped=kind == "json.gz")
-                self.log(status="done", source=str(src), output=str(target), kind=kind, **info)
+                if info.pop("partial", False):
+                    partial_output = info.pop("partial_output")
+                    error = info.pop("error")
+                    self.log(
+                        status="partial",
+                        source=str(src),
+                        output=partial_output,
+                        kind=kind,
+                        error=error,
+                        **info,
+                    )
+                else:
+                    self.log(status="done", source=str(src), output=str(target), kind=kind, **info)
                 return
 
             if kind in {"geojson", "kml", "shapefile"}:
@@ -800,7 +842,7 @@ class Migrator:
                 self.log(status="unsupported", source=str(src), kind=kind, reason="7z archive handler not enabled")
                 return
 
-            if src.suffix.lower() in SKIP_SUFFIXES or kind == "text/xml":
+            if kind == "non-tabular" or src.suffix.lower() in SKIP_SUFFIXES or kind == "text/xml":
                 self.log(status="unsupported", source=str(src), kind=kind, reason="non-tabular or schema-specific format")
                 return
 
