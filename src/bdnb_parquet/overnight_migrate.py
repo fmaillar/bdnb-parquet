@@ -98,7 +98,7 @@ def parquet_valid(path: Path) -> dict[str, int] | None:
 def magic_kind(path: Path) -> str:
     try:
         with path.open("rb") as fh:
-            head = fh.read(16)
+            head = fh.read(64 * 1024)
     except OSError:
         return "unknown"
 
@@ -106,19 +106,53 @@ def magic_kind(path: Path) -> str:
         return "parquet"
     if head.startswith(b"PK\x03\x04") or head.startswith(b"PK\x05\x06"):
         return "zip"
+    if head.startswith(b"7z\xbc\xaf\x27\x1c"):
+        return "7z"
+    if head.startswith(b"Rar!\x1a\x07"):
+        return "rar"
+    if head.startswith(b"BZh"):
+        return "bzip2"
     if head.startswith(b"SQLite format 3\x00"):
         return "sqlite"
     # ESRI shapefile: file code 9994 big-endian.
     if len(head) >= 4 and head[:4] == b"\x00\x00\x27\x0a":
         return "shapefile"
     if head.startswith(b"\x1f\x8b"):
-        return "gzip"
+        return gzip_payload_kind(path)
     stripped = head.lstrip()
     if stripped.startswith(b"<?xml") or stripped.startswith(b"<"):
+        probe = stripped[:64 * 1024].lower()
+        if (
+            b"urn:schemas-microsoft-com:office:spreadsheet" in probe
+            or b"<workbook" in probe
+        ):
+            return "spreadsheetml"
         return "text/xml"
     if stripped.startswith(b"{") or stripped.startswith(b"["):
         return "json"
     return "unknown"
+
+
+def gzip_payload_kind(path: Path) -> str:
+    try:
+        with gzip.open(path, "rb") as fh:
+            head = fh.read(256 * 1024)
+    except (OSError, EOFError):
+        return "gzip"
+
+    stripped = head.lstrip()
+    if stripped.startswith(b"{") or stripped.startswith(b"["):
+        return "json.gz"
+
+    try:
+        text = head.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = head.decode("cp1252", errors="replace")
+
+    first = text.splitlines()[0] if text.splitlines() else ""
+    if any(d in first for d in (";", ",", "\t", "|")):
+        return "csv.gz"
+    return "gzip"
 
 
 def suffix_kind(path: Path) -> str:
@@ -768,6 +802,68 @@ def copy_parquet(src: Path, dst: Path) -> dict[str, Any]:
     return out
 
 
+def spreadsheetml_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
+    import xml.etree.ElementTree as ET
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+    schema = pa.schema([pa.field("row_json", pa.string(), nullable=False)])
+    writer = pq.ParquetWriter(
+        tmp,
+        schema,
+        compression="zstd",
+        compression_level=3,
+        use_dictionary=False,
+        write_statistics=True,
+    )
+    rows = 0
+    batch: list[str] = []
+
+    def flush() -> None:
+        nonlocal batch
+        if not batch:
+            return
+        table = pa.Table.from_arrays(
+            [pa.array(batch, type=pa.string())],
+            schema=schema,
+        )
+        writer.write_table(table, row_group_size=min(len(batch), 100_000))
+        batch = []
+
+    try:
+        for _, elem in ET.iterparse(src, events=("end",)):
+            if elem.tag.rsplit("}", 1)[-1] != "Row":
+                continue
+            values: list[str | None] = []
+            for cell in elem:
+                if cell.tag.rsplit("}", 1)[-1] != "Cell":
+                    continue
+                value: str | None = None
+                for child in cell:
+                    if child.tag.rsplit("}", 1)[-1] == "Data":
+                        value = child.text
+                        break
+                values.append(value)
+            batch.append(
+                json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+            )
+            rows += 1
+            elem.clear()
+            if len(batch) >= 25_000:
+                flush()
+        flush()
+    finally:
+        writer.close()
+
+    info = parquet_valid(tmp)
+    if info is None or info["rows"] != rows:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"invalid SpreadsheetML Parquet output for {src}")
+    os.replace(tmp, dst)
+    return {**info, "representation": "spreadsheetml-row-json"}
+
+
 def spreadsheet_engine(src: Path) -> str | None:
     with src.open("rb") as fh:
         head = fh.read(4096)
@@ -897,6 +993,7 @@ def retry_sources_from_log(
     *,
     statuses: set[str],
     kinds: set[str] | None = None,
+    min_size: int = 0,
 ) -> list[Path]:
     """Return existing top-level raw sources whose latest status/kind is selected."""
     latest: dict[str, tuple[str, str]] = {}
@@ -933,6 +1030,11 @@ def retry_sources_from_log(
             continue
         path = Path(source)
         if path.is_file():
+            try:
+                if path.stat().st_size < min_size:
+                    continue
+            except OSError:
+                continue
             selected.append(path)
         else:
             missing.append(source)
@@ -1110,6 +1212,16 @@ class Migrator:
                 self.log(status="done", source=str(src), output=str(target_dir), kind="gpkg", layers=len(results), rows=sum(int(x.get("rows", 0)) for x in results))
                 return
 
+            if kind == "spreadsheetml":
+                self.reserve_for_source(src, kind)
+                target = dst if dst.suffix == ".parquet" else dst.with_suffix(".parquet")
+                if parquet_valid(target) is not None:
+                    self.log(status="skip", source=str(src), output=str(target), kind=kind)
+                    return
+                info = spreadsheetml_to_parquet(src, target)
+                self.log(status="done", source=str(src), output=str(target), kind=kind, **info)
+                return
+
             if kind in {"xlsx", "xls", "ods"}:
                 if src.stat().st_size > MAX_SPREADSHEET_BYTES:
                     self.log(
@@ -1204,8 +1316,85 @@ class Migrator:
                 return
 
             if kind == "7z":
-                self.log(status="unsupported", source=str(src), kind=kind, reason="7z archive handler not enabled")
+                archive_id = stable_name(src.name)
+                target_root = (dst.parent / archive_id) if dst.suffix else dst
+                marker = target_root / "_SUCCESS.json"
+                if marker.exists():
+                    self.log(status="skip", source=str(src), output=str(target_root), kind=kind)
+                    return
+                if target_root.exists():
+                    self.log(
+                        status="failed",
+                        source=str(src),
+                        output=str(target_root),
+                        kind=kind,
+                        error="existing archive output lacks _SUCCESS marker",
+                    )
+                    return
+
+                self.ensure_free_space(src.stat().st_size * 8 + MIN_FREE_BYTES)
+                staging = target_root.with_name(target_root.name + ".staging")
+                staging.mkdir(parents=True, exist_ok=True)
+                self.temp_root.mkdir(parents=True, exist_ok=True)
+                failed_before = self.counts["failed"]
+
+                with tempfile.TemporaryDirectory(
+                    prefix="bdnb-7z-",
+                    dir=self.temp_root,
+                ) as td:
+                    extracted = extract_with_7zip(src, Path(td))
+                    for member in extracted:
+                        if member.suffix.lower() in {
+                            ".dbf", ".shx", ".sbn", ".sbx", ".prj", ".cpg",
+                            ".qml", ".pdf", ".tif", ".tiff",
+                        }:
+                            continue
+                        rel = member.relative_to(td)
+                        member_output = Path(str(staging / rel) + ".parquet")
+                        self.migrate_file(
+                            member,
+                            depth=depth + 1,
+                            base_output=member_output,
+                        )
+
+                if self.counts["failed"] > failed_before:
+                    self.log(
+                        status="partial",
+                        source=str(src),
+                        output=str(staging),
+                        kind=kind,
+                        reason="one or more archive members failed; staging preserved for resume",
+                    )
+                    return
+
+                atomic_json(
+                    staging / "_SUCCESS.json",
+                    {
+                        "status": "ok",
+                        "created_at": utc_now(),
+                        "source": str(src),
+                    },
+                )
+                os.replace(staging, target_root)
+                self.log(status="done", source=str(src), output=str(target_root), kind=kind)
                 return
+
+            if kind == "non-tabular" and src.suffix.lower() == ".txt":
+                try:
+                    header, delimiter = csv_header_and_delimiter(src)
+                    if len(header) >= 2 and delimiter in {",", ";", "\t", "|"}:
+                        target = dst if dst.suffix == ".parquet" else dst.with_suffix(".parquet")
+                        info = write_csv(src, target)
+                        self.log(
+                            status="done",
+                            source=str(src),
+                            output=str(target),
+                            kind="sniffed-delimited-text",
+                            **info,
+                        )
+                        return
+                except Exception:
+                    pass
 
             if kind == "non-tabular" or src.suffix.lower() in SKIP_SUFFIXES or kind == "text/xml":
                 self.log(status="unsupported", source=str(src), kind=kind, reason="non-tabular or schema-specific format")
@@ -1351,7 +1540,7 @@ class Migrator:
         if kind in {
             "parquet", "csv", "tsv", "csv.gz", "json", "json.gz",
             "geojson", "kml", "shapefile", "gpkg", "sqlite",
-            "xlsx", "xls", "ods", "zip",
+            "xlsx", "xls", "ods", "spreadsheetml", "zip", "7z",
         }:
             return True
         return kind == "unknown" and src.suffix == ""
@@ -1528,7 +1717,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--retry-status",
         action="append",
-        choices=("failed", "partial"),
+        choices=("failed", "partial", "ignored"),
         help=(
             "status to retry from --retry-from-log; may be repeated; "
             "defaults to failed+partial"
@@ -1541,6 +1730,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "optional kind filter for --retry-from-log (for example: zip); "
             "may be repeated"
         ),
+    )
+    parser.add_argument(
+        "--retry-min-size",
+        type=int,
+        default=0,
+        help="minimum source size in bytes for --retry-from-log",
     )
     parser.add_argument(
         "--worker-file",
@@ -1583,6 +1778,7 @@ def main(argv: list[str] | None = None) -> int:
                 migrator.raw_root,
                 statuses=retry_statuses,
                 kinds=retry_kinds,
+                min_size=args.retry_min_size,
             )
             kind_text = (
                 f" kind={','.join(sorted(retry_kinds))}"
