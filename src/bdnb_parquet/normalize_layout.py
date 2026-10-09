@@ -69,7 +69,7 @@ def build_plan(root: Path) -> list[Move]:
         src_root = root / src_prefix
         if not src_root.exists():
             continue
-        for src in sorted(p for p in src_root.rglob("*") if p.is_file()):
+        for src in sorted(src_root.rglob("*.parquet")):
             rel = src.relative_to(src_root)
             dst = root / dst_prefix / rel
             moves.append(
