@@ -614,6 +614,55 @@ def extract_zip(src: Path, temp: Path) -> list[Path]:
         return extract_with_7zip(src, temp)
 
 
+
+def retry_sources_from_log(log_path: Path, raw_root: Path) -> list[Path]:
+    """Return existing top-level raw sources whose latest log state needs retry."""
+    latest: dict[str, str] = {}
+    raw_prefix = str(raw_root.resolve()) + os.sep
+
+    with log_path.open("r", encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"invalid JSONL in retry log at line {lineno}: {exc}"
+                ) from exc
+
+            source = record.get("source")
+            status = record.get("status")
+            if not isinstance(source, str) or not isinstance(status, str):
+                continue
+            # Archive members use "archive!member"; only retry the owning raw
+            # source, never ephemeral extraction paths or nested member records.
+            if "!" in source or not source.startswith(raw_prefix):
+                continue
+            latest[source] = status
+
+    selected: list[Path] = []
+    missing: list[str] = []
+    for source, status in latest.items():
+        if status not in {"failed", "partial"}:
+            continue
+        path = Path(source)
+        if path.is_file():
+            selected.append(path)
+        else:
+            missing.append(source)
+
+    if missing:
+        print(
+            f"RETRY: {len(missing)} failed/partial sources no longer exist; skipped",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    return sorted(selected, key=lambda p: str(p))
+
+
 class Migrator:
     def __init__(self, root: Path, *, log_path: Path, max_depth: int = 4) -> None:
         self.root = root.resolve()
@@ -1080,22 +1129,31 @@ class Migrator:
             if not finished:
                 time.sleep(0.25)
 
-    def run(self, *, workers: int = 1) -> int:
+    def run(
+        self,
+        *,
+        workers: int = 1,
+        files: list[Path] | None = None,
+    ) -> int:
         if not self.raw_root.exists():
             raise FileNotFoundError(self.raw_root)
         self.parquet_root.mkdir(parents=True, exist_ok=True)
         self.temp_root.mkdir(parents=True, exist_ok=True)
         self.ensure_free_space()
 
-        files: list[Path] = []
-        for dirpath, dirnames, filenames in os.walk(self.raw_root, topdown=True):
-            base = Path(dirpath)
-            rel = base.relative_to(self.raw_root).as_posix()
-            if any(rel == handled or rel.startswith(handled + "/") for handled in ALREADY_HANDLED):
-                dirnames[:] = []
-                continue
-            for filename in filenames:
-                files.append(base / filename)
+        if files is None:
+            files = []
+            for dirpath, dirnames, filenames in os.walk(self.raw_root, topdown=True):
+                base = Path(dirpath)
+                rel = base.relative_to(self.raw_root).as_posix()
+                if any(
+                    rel == handled or rel.startswith(handled + "/")
+                    for handled in ALREADY_HANDLED
+                ):
+                    dirnames[:] = []
+                    continue
+                for filename in filenames:
+                    files.append(base / filename)
 
         total = len(files)
         print(f"QUEUE: {total} raw files; workers={workers}", flush=True)
@@ -1147,6 +1205,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="isolated concurrent conversion processes; use 3 on HDD-backed m710s",
     )
     parser.add_argument(
+        "--retry-from-log",
+        type=Path,
+        help=(
+            "retry only top-level raw sources whose latest status in this JSONL "
+            "log is failed or partial"
+        ),
+    )
+    parser.add_argument(
         "--worker-file",
         type=Path,
         help=argparse.SUPPRESS,
@@ -1159,6 +1225,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.workers <= 0:
         parser.error("--workers must be positive")
+    if args.worker_file is not None and args.retry_from_log is not None:
+        parser.error("--worker-file and --retry-from-log are mutually exclusive")
+    if args.preflight and args.retry_from_log is not None:
+        parser.error("--preflight and --retry-from-log are mutually exclusive")
     return args
 
 
@@ -1171,7 +1241,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.preflight:
             return migrator.preflight()
-        return migrator.run(workers=args.workers)
+        retry_files = None
+        if args.retry_from_log is not None:
+            retry_log = args.retry_from_log.expanduser().resolve()
+            if not retry_log.is_file():
+                raise FileNotFoundError(retry_log)
+            retry_files = retry_sources_from_log(retry_log, migrator.raw_root)
+            print(
+                f"RETRY: selected {len(retry_files)} raw sources from {retry_log}",
+                flush=True,
+            )
+        return migrator.run(workers=args.workers, files=retry_files)
     except KeyboardInterrupt:
         print("Interrupted safely; rerun the same command to resume.", file=sys.stderr)
         return 130
