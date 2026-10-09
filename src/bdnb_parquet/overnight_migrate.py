@@ -819,6 +819,7 @@ def spreadsheetml_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
     )
     rows = 0
     batch: list[str] = []
+    parse_error: ET.ParseError | None = None
 
     def flush() -> None:
         nonlocal batch
@@ -832,26 +833,29 @@ def spreadsheetml_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
         batch = []
 
     try:
-        for _, elem in ET.iterparse(src, events=("end",)):
-            if elem.tag.rsplit("}", 1)[-1] != "Row":
-                continue
-            values: list[str | None] = []
-            for cell in elem:
-                if cell.tag.rsplit("}", 1)[-1] != "Cell":
+        try:
+            for _, elem in ET.iterparse(src, events=("end",)):
+                if elem.tag.rsplit("}", 1)[-1] != "Row":
                     continue
-                value: str | None = None
-                for child in cell:
-                    if child.tag.rsplit("}", 1)[-1] == "Data":
-                        value = child.text
-                        break
-                values.append(value)
-            batch.append(
-                json.dumps(values, ensure_ascii=False, separators=(",", ":"))
-            )
-            rows += 1
-            elem.clear()
-            if len(batch) >= 25_000:
-                flush()
+                values: list[str | None] = []
+                for cell in elem:
+                    if cell.tag.rsplit("}", 1)[-1] != "Cell":
+                        continue
+                    value: str | None = None
+                    for child in cell:
+                        if child.tag.rsplit("}", 1)[-1] == "Data":
+                            value = child.text
+                            break
+                    values.append(value)
+                batch.append(
+                    json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+                )
+                rows += 1
+                elem.clear()
+                if len(batch) >= 25_000:
+                    flush()
+        except ET.ParseError as exc:
+            parse_error = exc
         flush()
     finally:
         writer.close()
@@ -860,9 +864,32 @@ def spreadsheetml_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
     if info is None or info["rows"] != rows:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(f"invalid SpreadsheetML Parquet output for {src}")
-    os.replace(tmp, dst)
-    return {**info, "representation": "spreadsheetml-row-json"}
 
+    if parse_error is None:
+        os.replace(tmp, dst)
+        return {**info, "representation": "spreadsheetml-row-json"}
+
+    partial = dst.with_suffix(".partial.parquet")
+    sidecar = dst.with_suffix(".partial.json")
+    os.replace(tmp, partial)
+    atomic_json(
+        sidecar,
+        {
+            "status": "partial",
+            "source": str(src),
+            "output": str(partial),
+            "rows_recovered": rows,
+            "error": f"{type(parse_error).__name__}: {parse_error}",
+            "created_at": utc_now(),
+        },
+    )
+    return {
+        **info,
+        "partial": True,
+        "partial_output": str(partial),
+        "error": f"{type(parse_error).__name__}: {parse_error}",
+        "representation": "spreadsheetml-row-json",
+    }
 
 def spreadsheet_engine(src: Path) -> str | None:
     with src.open("rb") as fh:
@@ -1223,7 +1250,19 @@ class Migrator:
                     self.log(status="skip", source=str(src), output=str(target), kind=kind)
                     return
                 info = spreadsheetml_to_parquet(src, target)
-                self.log(status="done", source=str(src), output=str(target), kind=kind, **info)
+                if info.pop("partial", False):
+                    partial_output = info.pop("partial_output")
+                    error = info.pop("error")
+                    self.log(
+                        status="partial",
+                        source=str(src),
+                        output=partial_output,
+                        kind=kind,
+                        error=error,
+                        **info,
+                    )
+                else:
+                    self.log(status="done", source=str(src), output=str(target), kind=kind, **info)
                 return
 
             if kind in {"xlsx", "xls", "ods"}:
