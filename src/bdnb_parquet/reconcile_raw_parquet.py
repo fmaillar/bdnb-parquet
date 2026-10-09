@@ -110,11 +110,10 @@ def main(argv: list[str] | None = None) -> int:
 
     for src, (cls, reason) in sorted(states.items()):
         p = Path(src)
-        try:
-            size = p.stat().st_size
-        except OSError:
-            size = 0
+        if not p.is_file():
+            continue
 
+        size = p.stat().st_size
         rel = p.relative_to(raw_root).as_posix()
         rows.append((rel, cls, size, reason))
         counts[cls] += 1
