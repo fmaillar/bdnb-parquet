@@ -47,7 +47,7 @@ SKIP_SUFFIXES = {
     ".txt", ".md", ".rtf",
     ".nc", ".tif", ".tiff", ".asc",
     ".qml", ".sld", ".lyr", ".lyrx",
-    ".prj", ".cpg", ".dbf", ".shx",
+    ".prj", ".cpg", ".dbf", ".shx", ".sbn", ".sbx",
     ".xml", ".dxf",
 }
 
@@ -305,12 +305,13 @@ def write_geo(src: Path, dst: Path, *, layer: str | None = None) -> dict[str, An
     source_path: str | Path = src
     alias_dir: tempfile.TemporaryDirectory[str] | None = None
     old_restore_shx = os.environ.get("SHAPE_RESTORE_SHX")
-    if suffix_kind(src) == "shapefile" and src.suffix.lower() != ".shp":
-        alias_dir = tempfile.TemporaryDirectory(prefix="bdnb-shp-alias-")
-        alias = Path(alias_dir.name) / (src.name + ".shp")
-        os.symlink(src, alias)
-        source_path = alias
+    if suffix_kind(src) == "shapefile":
         os.environ["SHAPE_RESTORE_SHX"] = "YES"
+        if src.suffix.lower() != ".shp":
+            alias_dir = tempfile.TemporaryDirectory(prefix="bdnb-shp-alias-")
+            alias = Path(alias_dir.name) / (src.name + ".shp")
+            os.symlink(src, alias)
+            source_path = alias
 
     try:
         with open_arrow(source_path, **kwargs) as source:
@@ -767,13 +768,30 @@ def copy_parquet(src: Path, dst: Path) -> dict[str, Any]:
     return out
 
 
+def spreadsheet_engine(src: Path) -> str | None:
+    with src.open("rb") as fh:
+        head = fh.read(4096)
+    if head.startswith(b"PK\\x03\\x04"):
+        return "openpyxl"
+    if head.startswith(bytes.fromhex("D0CF11E0A1B11AE1")):
+        return "xlrd"
+    stripped = head.lstrip().lower()
+    if stripped.startswith(b"<?xml") or stripped.startswith(b"<html") or stripped.startswith(b"<!doctype html"):
+        return None
+    return None
+
 def spreadsheet_to_parquet(src: Path, dst_dir: Path) -> list[dict[str, Any]]:
     try:
         import pandas as pd
     except ImportError as exc:
         raise RuntimeError("spreadsheet support requires pandas/openpyxl/xlrd/odfpy") from exc
 
-    sheets = pd.read_excel(src, sheet_name=None, dtype=str)
+    engine = spreadsheet_engine(src)
+    if engine is None:
+        raise RuntimeError(
+            f"spreadsheet extension does not match a supported Excel container: {src}"
+        )
+    sheets = pd.read_excel(src, sheet_name=None, dtype=str, engine=engine)
     results: list[dict[str, Any]] = []
     for sheet_name, frame in sheets.items():
         target = dst_dir / f"{slug(str(sheet_name))}.parquet"
@@ -1159,7 +1177,7 @@ class Migrator:
                         if member_kind in {"unknown", "text/xml"} and member.suffix.lower() in SKIP_SUFFIXES:
                             self.log(status="unsupported", source=f"{src}!{member.relative_to(td)}", kind=member_kind, reason="non-tabular archive member")
                             continue
-                        if member.suffix.lower() in {".dbf", ".shx", ".prj", ".cpg", ".qml", ".pdf", ".tif", ".tiff"}:
+                        if member.suffix.lower() in {".dbf", ".shx", ".sbn", ".sbx", ".prj", ".cpg", ".qml", ".pdf", ".tif", ".tiff"}:
                             continue
                         rel = member.relative_to(td)
                         # Preserve the complete member name to prevent collisions
