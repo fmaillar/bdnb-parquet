@@ -194,6 +194,101 @@ def geo_metadata(meta: dict[str, Any], geometry_name: str) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
 
 
+def write_geojson_features_lossless(
+    src: Path,
+    dst: Path,
+) -> dict[str, Any]:
+    """Stream GeoJSON FeatureCollection features as lossless JSON text.
+
+    If the GeoJSON is truncated, publish only a ``*.partial.parquet`` output.
+    """
+    import ijson
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+    schema = pa.schema([pa.field("feature_json", pa.string(), nullable=False)])
+    writer = pq.ParquetWriter(
+        tmp,
+        schema,
+        compression="zstd",
+        compression_level=3,
+        use_dictionary=False,
+        write_statistics=True,
+    )
+    rows = 0
+    batch: list[str] = []
+    parse_error: Exception | None = None
+
+    def flush() -> None:
+        nonlocal batch
+        if not batch:
+            return
+        table = pa.Table.from_arrays(
+            [pa.array(batch, type=pa.string())],
+            schema=schema,
+        )
+        writer.write_table(table, row_group_size=min(len(batch), 100_000))
+        batch = []
+
+    try:
+        with src.open("rb") as fh:
+            try:
+                for feature in ijson.items(fh, "features.item"):
+                    batch.append(
+                        json.dumps(
+                            feature,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            default=str,
+                        )
+                    )
+                    rows += 1
+                    if len(batch) >= 25_000:
+                        flush()
+            except ijson.JSONError as exc:
+                parse_error = exc
+        flush()
+    finally:
+        writer.close()
+
+    if rows == 0:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"GeoJSON FeatureCollection yielded no features: {src}")
+    info = parquet_valid(tmp)
+    if info is None or info["rows"] != rows:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"invalid GeoJSON salvage Parquet output for {src}")
+
+    if parse_error is None:
+        os.replace(tmp, dst)
+        return {
+            **info,
+            "representation": "lossless-geojson-feature-text",
+        }
+
+    partial = dst.with_suffix(".partial.parquet")
+    sidecar = dst.with_suffix(".partial.json")
+    os.replace(tmp, partial)
+    atomic_json(
+        sidecar,
+        {
+            "status": "partial",
+            "source": str(src),
+            "output": str(partial),
+            "rows_recovered": rows,
+            "error": f"{type(parse_error).__name__}: {parse_error}",
+            "created_at": utc_now(),
+        },
+    )
+    return {
+        **info,
+        "partial": True,
+        "partial_output": str(partial),
+        "error": f"{type(parse_error).__name__}: {parse_error}",
+        "representation": "lossless-geojson-feature-text",
+    }
+
 def write_geo(src: Path, dst: Path, *, layer: str | None = None) -> dict[str, Any]:
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".tmp")
@@ -208,8 +303,14 @@ def write_geo(src: Path, dst: Path, *, layer: str | None = None) -> dict[str, An
         kwargs["layer"] = layer
 
     source_path: str | Path = src
+    alias_dir: tempfile.TemporaryDirectory[str] | None = None
+    old_restore_shx = os.environ.get("SHAPE_RESTORE_SHX")
     if suffix_kind(src) == "shapefile" and src.suffix.lower() != ".shp":
-        source_path = f"ESRI Shapefile:{src}"
+        alias_dir = tempfile.TemporaryDirectory(prefix="bdnb-shp-alias-")
+        alias = Path(alias_dir.name) / (src.name + ".shp")
+        os.symlink(src, alias)
+        source_path = alias
+        os.environ["SHAPE_RESTORE_SHX"] = "YES"
 
     try:
         with open_arrow(source_path, **kwargs) as source:
@@ -245,6 +346,12 @@ def write_geo(src: Path, dst: Path, *, layer: str | None = None) -> dict[str, An
     finally:
         if writer is not None:
             writer.close()
+        if alias_dir is not None:
+            alias_dir.cleanup()
+        if old_restore_shx is None:
+            os.environ.pop("SHAPE_RESTORE_SHX", None)
+        else:
+            os.environ["SHAPE_RESTORE_SHX"] = old_restore_shx
 
     info = parquet_valid(tmp)
     if info is None or info["rows"] != rows:
@@ -265,7 +372,7 @@ def csv_header_and_delimiter(path: Path, *, gzipped: bool = False) -> tuple[list
         delimiter = dialect.delimiter
     except csv.Error:
         delimiter = "\t" if "\t" in sample.splitlines()[0] else ","
-    reader = csv.reader(io.StringIO(sample), delimiter=delimiter)
+    reader = csv.reader(io.StringIO(sample, newline=""), delimiter=delimiter)
     try:
         header = next(reader)
     except StopIteration:
@@ -409,6 +516,10 @@ def write_csv(src: Path, dst: Path, *, gzipped: bool = False) -> dict[str, Any]:
     try:
         return write_csv_arrow(src, dst, gzipped=gzipped)
     except (pa.ArrowInvalid, UnicodeDecodeError, csv.Error):
+        return write_csv_lossless_rows(src, dst, gzipped=gzipped)
+    except RuntimeError as exc:
+        if "invalid CSV Parquet output" not in str(exc):
+            raise
         return write_csv_lossless_rows(src, dst, gzipped=gzipped)
 
 def write_json_array_lossless(
@@ -755,8 +866,8 @@ def extract_zip(src: Path, temp: Path) -> list[Path]:
                     shutil.copyfileobj(inp, out, length=16 * 1024 * 1024)
                 extracted.append(target)
         return extracted
-    except zipfile.BadZipFile:
-        # Some real ZIP archives have central-directory quirks that Python
+    except (zipfile.BadZipFile, NotImplementedError):
+        # Some real ZIP archives have central-directory quirks or compression
         # rejects but 7-Zip can still read safely.
         return extract_with_7zip(src, temp)
 
@@ -909,11 +1020,17 @@ class Migrator:
                 except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
                     if json_layout(src, gzipped=kind == "json.gz") != "object-stream":
                         raise
-                    info = write_json_lines_lossless(
-                        src,
-                        target,
-                        gzipped=kind == "json.gz",
-                    )
+                    try:
+                        info = write_json_lines_lossless(
+                            src,
+                            target,
+                            gzipped=kind == "json.gz",
+                        )
+                    except RuntimeError:
+                        if kind == "json" and not src.name.lower().endswith(".json"):
+                            info = write_geojson_features_lossless(src, target)
+                        else:
+                            raise
                 if info.pop("partial", False):
                     partial_output = info.pop("partial_output")
                     error = info.pop("error")
@@ -935,8 +1052,25 @@ class Migrator:
                 if parquet_valid(target) is not None:
                     self.log(status="skip", source=str(src), output=str(target), kind=kind)
                     return
-                info = write_geo(src, target)
-                self.log(status="done", source=str(src), output=str(target), kind=kind, **info)
+                try:
+                    info = write_geo(src, target)
+                except Exception:
+                    if kind != "geojson":
+                        raise
+                    info = write_geojson_features_lossless(src, target)
+                if info.pop("partial", False):
+                    partial_output = info.pop("partial_output")
+                    error = info.pop("error")
+                    self.log(
+                        status="partial",
+                        source=str(src),
+                        output=partial_output,
+                        kind=kind,
+                        error=error,
+                        **info,
+                    )
+                else:
+                    self.log(status="done", source=str(src), output=str(target), kind=kind, **info)
                 return
 
             if kind in {"gpkg", "sqlite"}:
