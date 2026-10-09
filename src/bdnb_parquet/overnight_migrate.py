@@ -878,9 +878,10 @@ def retry_sources_from_log(
     raw_root: Path,
     *,
     statuses: set[str],
+    kinds: set[str] | None = None,
 ) -> list[Path]:
-    """Return existing top-level raw sources whose latest status is selected."""
-    latest: dict[str, str] = {}
+    """Return existing top-level raw sources whose latest status/kind is selected."""
+    latest: dict[str, tuple[str, str]] = {}
     raw_prefix = str(raw_root.resolve()) + os.sep
 
     with log_path.open("r", encoding="utf-8") as fh:
@@ -903,12 +904,14 @@ def retry_sources_from_log(
             # source, never ephemeral extraction paths or nested member records.
             if "!" in source or not source.startswith(raw_prefix):
                 continue
-            latest[source] = status
+            latest[source] = (status, str(record.get("kind", "")))
 
     selected: list[Path] = []
     missing: list[str] = []
-    for source, status in latest.items():
+    for source, (status, kind) in latest.items():
         if status not in statuses:
+            continue
+        if kinds is not None and kind not in kinds:
             continue
         path = Path(source)
         if path.is_file():
@@ -1514,6 +1517,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--retry-kind",
+        action="append",
+        help=(
+            "optional kind filter for --retry-from-log (for example: zip); "
+            "may be repeated"
+        ),
+    )
+    parser.add_argument(
         "--worker-file",
         type=Path,
         help=argparse.SUPPRESS,
@@ -1548,14 +1559,22 @@ def main(argv: list[str] | None = None) -> int:
             if not retry_log.is_file():
                 raise FileNotFoundError(retry_log)
             retry_statuses = set(args.retry_status or ("failed", "partial"))
+            retry_kinds = set(args.retry_kind) if args.retry_kind else None
             retry_files = retry_sources_from_log(
                 retry_log,
                 migrator.raw_root,
                 statuses=retry_statuses,
+                kinds=retry_kinds,
+            )
+            kind_text = (
+                f" kind={','.join(sorted(retry_kinds))}"
+                if retry_kinds is not None
+                else ""
             )
             print(
                 f"RETRY: selected {len(retry_files)} raw sources "
-                f"with status={','.join(sorted(retry_statuses))} from {retry_log}",
+                f"with status={','.join(sorted(retry_statuses))}"
+                f"{kind_text} from {retry_log}",
                 flush=True,
             )
         return migrator.run(workers=args.workers, files=retry_files)
