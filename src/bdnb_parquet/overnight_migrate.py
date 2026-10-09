@@ -348,7 +348,15 @@ def write_geo(src: Path, dst: Path, *, layer: str | None = None) -> dict[str, An
             source_path = alias
 
     try:
-        with open_arrow(source_path, **kwargs) as source:
+        try:
+            source_ctx = open_arrow(source_path, **kwargs)
+        except UnicodeDecodeError:
+            if suffix_kind(src) != "shapefile":
+                raise
+            kwargs["encoding"] = "CP1252"
+            source_ctx = open_arrow(source_path, **kwargs)
+
+        with source_ctx as source:
             meta, reader = source
             geometry_name = meta.get("geometry_name") or "wkb_geometry"
             for batch in reader:
@@ -1042,14 +1050,27 @@ def spreadsheetml_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
 
 def spreadsheet_engine(src: Path) -> str | None:
     with src.open("rb") as fh:
-        head = fh.read(4096)
+        head = fh.read(256 * 1024)
+
     if head.startswith(b"PK\\x03\\x04"):
+        try:
+            with zipfile.ZipFile(src) as zf:
+                names = set(zf.namelist())
+                if "mimetype" in names:
+                    mimetype = zf.read("mimetype").decode(
+                        "ascii", errors="ignore"
+                    )
+                    if "opendocument.spreadsheet" in mimetype:
+                        return "odf"
+                if "[Content_Types].xml" in names:
+                    return "openpyxl"
+        except zipfile.BadZipFile:
+            pass
         return "odf" if src.suffix.lower() == ".ods" else "openpyxl"
+
     if head.startswith(bytes.fromhex("D0CF11E0A1B11AE1")):
         return "xlrd"
-    stripped = head.lstrip().lower()
-    if stripped.startswith(b"<?xml") or stripped.startswith(b"<html") or stripped.startswith(b"<!doctype html"):
-        return None
+
     return None
 
 def spreadsheet_to_parquet(src: Path, dst_dir: Path) -> list[dict[str, Any]]:
@@ -1068,17 +1089,14 @@ def spreadsheet_to_parquet(src: Path, dst_dir: Path) -> list[dict[str, Any]]:
         # A number of public-sector ".xls" resources are actually
         # SpreadsheetML XML, HTML tables, or delimited text exports.
         if (
-            lower.startswith(b"<?xml")
-            and (
-                b"urn:schemas-microsoft-com:office:spreadsheet" in lower
-                or b"<workbook" in lower
-            )
+            b"urn:schemas-microsoft-com:office:spreadsheet" in lower
+            or b"<workbook" in lower
         ):
             target = dst_dir / "sheet1.parquet"
             info = spreadsheetml_to_parquet(src, target)
             return [{"sheet": "sheet1", "path": str(target), **info}]
 
-        if lower.startswith(b"<html") or lower.startswith(b"<!doctype html"):
+        if b"<html" in lower or b"<table" in lower:
             frames = pd.read_html(src, dtype_backend="numpy_nullable")
             results: list[dict[str, Any]] = []
             for index, frame in enumerate(frames, start=1):
@@ -1100,15 +1118,36 @@ def spreadsheet_to_parquet(src: Path, dst_dir: Path) -> list[dict[str, Any]]:
             if results:
                 return results
 
-        # Last-resort legacy export: try it as delimited text.
-        try:
-            header, delimiter = csv_header_and_delimiter(src)
-            if len(header) >= 2 and delimiter in {",", ";", "\\t", "|"}:
-                target = dst_dir / "sheet1.parquet"
-                info = write_csv(src, target)
-                return [{"sheet": "sheet1", "path": str(target), **info}]
-        except Exception:
-            pass
+        # Last-resort legacy export: many historical ".xls" files
+        # are UTF-8/CP1252/UTF-16 delimited text produced for Excel.
+        for encoding in ("utf-8-sig", "utf-16", "cp1252"):
+            try:
+                text = src.read_text(encoding=encoding, errors="strict")
+            except (UnicodeError, OSError):
+                continue
+            sample = text[:256 * 1024]
+            first = sample.splitlines()[0] if sample.splitlines() else ""
+            delimiter = max(
+                ("\\t", ";", ",", "|"),
+                key=lambda d: first.count(d),
+            )
+            if first.count(delimiter) < 1:
+                continue
+
+            target = dst_dir / "sheet1.parquet"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp_text = dst_dir / ".legacy-spreadsheet.csv"
+            try:
+                tmp_text.write_text(text, encoding="utf-8")
+                info = write_csv(tmp_text, target)
+            finally:
+                tmp_text.unlink(missing_ok=True)
+            return [{
+                "sheet": "sheet1",
+                "path": str(target),
+                "source_encoding": encoding,
+                **info,
+            }]
 
         raise RuntimeError(
             f"spreadsheet extension does not match a supported Excel container: {src}"
