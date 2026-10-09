@@ -1044,6 +1044,86 @@ def spreadsheetml_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
         "representation": "spreadsheetml-row-json",
     }
 
+def write_text_lines_lossless(src: Path, dst: Path) -> dict[str, Any]:
+    """Store an arbitrary text export losslessly as one Parquet row per line."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+
+    raw = src.read_bytes()
+    if b"\x00" in raw[:1024 * 1024]:
+        raise RuntimeError(f"file is not plausibly text: {src}")
+
+    encoding = "utf-8-sig"
+    try:
+        raw[:1024 * 1024].decode(encoding, errors="strict")
+    except UnicodeDecodeError:
+        encoding = "cp1252"
+
+    schema = pa.schema(
+        [
+            pa.field("line_number", pa.int64(), nullable=False),
+            pa.field("text", pa.string(), nullable=False),
+        ]
+    )
+    writer = pq.ParquetWriter(
+        tmp,
+        schema,
+        compression="zstd",
+        compression_level=3,
+        use_dictionary=False,
+        write_statistics=True,
+    )
+
+    numbers: list[int] = []
+    lines: list[str] = []
+    rows = 0
+
+    def flush() -> None:
+        nonlocal numbers, lines
+        if not numbers:
+            return
+        table = pa.Table.from_arrays(
+            [
+                pa.array(numbers, type=pa.int64()),
+                pa.array(lines, type=pa.string()),
+            ],
+            schema=schema,
+        )
+        writer.write_table(table, row_group_size=len(numbers))
+        numbers, lines = [], []
+
+    try:
+        with src.open(
+            "rt",
+            encoding=encoding,
+            errors="strict",
+            newline="",
+        ) as fh:
+            for line_number, line in enumerate(fh, start=1):
+                # Keep line terminators represented explicitly in the text value.
+                numbers.append(line_number)
+                lines.append(line)
+                rows += 1
+                if len(lines) >= 50_000:
+                    flush()
+        flush()
+    finally:
+        writer.close()
+
+    info = parquet_valid(tmp)
+    if info is None or info["rows"] != rows:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"invalid text-line Parquet output for {src}")
+
+    os.replace(tmp, dst)
+    return {
+        **info,
+        "representation": "lossless-text-lines",
+        "encoding": encoding,
+    }
+
+
 def spreadsheet_engine(src: Path) -> str | None:
     with src.open("rb") as fh:
         head = fh.read(256 * 1024)
@@ -1152,9 +1232,17 @@ def spreadsheet_to_parquet(src: Path, dst_dir: Path) -> list[dict[str, Any]]:
                 **info,
             }]
 
-        raise RuntimeError(
-            f"spreadsheet extension does not match a supported Excel container: {src}"
-        )
+        # Final lossless fallback for legacy exports distributed with an
+        # Excel extension even though their payload is plain text.
+        target = dst_dir / "sheet1.parquet"
+        try:
+            info = write_text_lines_lossless(src, target)
+        except (UnicodeDecodeError, RuntimeError):
+            raise RuntimeError(
+                f"spreadsheet extension does not match a supported Excel container: {src}"
+            )
+        return [{"sheet": "sheet1", "path": str(target), **info}]
+
     sheets = pd.read_excel(src, sheet_name=None, dtype=str, engine=engine)
     results: list[dict[str, Any]] = []
     for sheet_name, frame in sheets.items():
