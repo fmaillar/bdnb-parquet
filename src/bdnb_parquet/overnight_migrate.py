@@ -664,6 +664,153 @@ def write_json_array_lossless(
         "representation": "lossless-json-text",
     }
 
+def write_json_object_lossless(
+    src: Path,
+    dst: Path,
+    *,
+    gzipped: bool = False,
+    batch_items: int = 25_000,
+) -> dict[str, Any]:
+    """Stream a top-level JSON object without assuming JSONL.
+
+    Top-level arrays are emitted item-by-item, while scalar/object metadata is
+    retained as JSON text.  The representation is reversible and avoids
+    materialising large FINESS-style arrays in memory.
+    """
+    import ijson
+
+    opener = gzip.open if gzipped else open
+
+    # First pass: discover top-level value kinds without materialising arrays.
+    value_kinds: list[tuple[str, str]] = []
+    current_key: str | None = None
+    seen: set[str] = set()
+    with opener(src, "rb") as fh:
+        for prefix, event, value in ijson.parse(fh):
+            if prefix == "" and event == "map_key":
+                current_key = str(value)
+                continue
+            if current_key is None or current_key in seen:
+                continue
+            if prefix != current_key:
+                continue
+            if event == "start_array":
+                value_kinds.append((current_key, "array"))
+                seen.add(current_key)
+            elif event == "start_map":
+                value_kinds.append((current_key, "object"))
+                seen.add(current_key)
+            elif event in {
+                "string",
+                "number",
+                "boolean",
+                "null",
+            }:
+                value_kinds.append((current_key, "scalar"))
+                seen.add(current_key)
+
+    if not value_kinds:
+        raise RuntimeError(f"JSON object has no top-level values: {src}")
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+
+    schema = pa.schema(
+        [
+            pa.field("key", pa.string(), nullable=False),
+            pa.field("kind", pa.string(), nullable=False),
+            pa.field("item_index", pa.int64(), nullable=True),
+            pa.field("json", pa.string(), nullable=False),
+        ]
+    )
+    writer = pq.ParquetWriter(
+        tmp,
+        schema,
+        compression="zstd",
+        compression_level=3,
+        use_dictionary=True,
+        write_statistics=True,
+    )
+    rows = 0
+    keys: list[str] = []
+    kinds: list[str] = []
+    indices: list[int | None] = []
+    values: list[str] = []
+
+    def emit(key: str, kind: str, index: int | None, value: Any) -> None:
+        nonlocal rows
+        keys.append(key)
+        kinds.append(kind)
+        indices.append(index)
+        values.append(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+        )
+        rows += 1
+        if len(keys) >= batch_items:
+            flush()
+
+    def flush() -> None:
+        nonlocal keys, kinds, indices, values
+        if not keys:
+            return
+        table = pa.Table.from_arrays(
+            [
+                pa.array(keys, type=pa.string()),
+                pa.array(kinds, type=pa.string()),
+                pa.array(indices, type=pa.int64()),
+                pa.array(values, type=pa.string()),
+            ],
+            schema=schema,
+        )
+        writer.write_table(table, row_group_size=len(keys))
+        keys, kinds, indices, values = [], [], [], []
+
+    try:
+        for key, kind in value_kinds:
+            if kind == "array":
+                count = 0
+                with opener(src, "rb") as fh:
+                    for index, item in enumerate(ijson.items(fh, f"{key}.item")):
+                        emit(key, "array-item", index, item)
+                        count += 1
+                if count == 0:
+                    emit(key, "empty-array", None, [])
+                continue
+
+            with opener(src, "rb") as fh:
+                iterator = ijson.items(fh, key)
+                try:
+                    value = next(iterator)
+                except StopIteration as exc:
+                    raise RuntimeError(
+                        f"missing top-level JSON value {key!r}: {src}"
+                    ) from exc
+            emit(key, kind, None, value)
+
+        flush()
+    finally:
+        writer.close()
+
+    info = parquet_valid(tmp)
+    if info is None or info["rows"] != rows:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"invalid JSON-object Parquet output for {src}")
+
+    os.replace(tmp, dst)
+    return {
+        **info,
+        "json_layout": "object",
+        "representation": "lossless-top-level-object-json",
+        "top_level_keys": len(value_kinds),
+    }
+
+
 def write_json_lines_lossless(
     src: Path,
     dst: Path,
@@ -735,6 +882,8 @@ def write_json(src: Path, dst: Path, *, gzipped: bool = False) -> dict[str, Any]
     layout = json_layout(src, gzipped=gzipped)
     if layout == "array":
         return write_json_array_lossless(src, dst, gzipped=gzipped)
+    if layout == "object-stream":
+        return write_json_object_lossless(src, dst, gzipped=gzipped)
     if layout in {"empty", "unknown"}:
         raise RuntimeError(f"unsupported JSON layout: {layout}")
 
