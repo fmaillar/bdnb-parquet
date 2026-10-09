@@ -207,8 +207,12 @@ def write_geo(src: Path, dst: Path, *, layer: str | None = None) -> dict[str, An
     if layer is not None:
         kwargs["layer"] = layer
 
+    source_path: str | Path = src
+    if suffix_kind(src) == "shapefile" and src.suffix.lower() != ".shp":
+        source_path = f"ESRI Shapefile:{src}"
+
     try:
-        with open_arrow(src, **kwargs) as source:
+        with open_arrow(source_path, **kwargs) as source:
             meta, reader = source
             geometry_name = meta.get("geometry_name") or "wkb_geometry"
             for batch in reader:
@@ -269,7 +273,79 @@ def csv_header_and_delimiter(path: Path, *, gzipped: bool = False) -> tuple[list
     return header, delimiter
 
 
-def write_csv(src: Path, dst: Path, *, gzipped: bool = False) -> dict[str, Any]:
+def write_csv_lossless_rows(
+    src: Path,
+    dst: Path,
+    *,
+    gzipped: bool = False,
+) -> dict[str, Any]:
+    """Fallback CSV reader storing each parsed row as a JSON array string.
+
+    This preserves ragged rows without inventing missing-column semantics.
+    """
+    _, delimiter = csv_header_and_delimiter(src, gzipped=gzipped)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+
+    opener = gzip.open if gzipped else open
+    encoding = "utf-8-sig"
+    try:
+        with opener(src, "rt", encoding=encoding, errors="strict", newline="") as probe:
+            probe.read(1024 * 1024)
+    except UnicodeDecodeError:
+        encoding = "cp1252"
+
+    schema = pa.schema([pa.field("row_json", pa.string(), nullable=False)])
+    writer = pq.ParquetWriter(
+        tmp,
+        schema,
+        compression="zstd",
+        compression_level=3,
+        use_dictionary=False,
+        write_statistics=True,
+    )
+    rows = 0
+    batch: list[str] = []
+
+    def flush() -> None:
+        nonlocal batch
+        if not batch:
+            return
+        table = pa.Table.from_arrays(
+            [pa.array(batch, type=pa.string())],
+            schema=schema,
+        )
+        writer.write_table(table, row_group_size=min(len(batch), 100_000))
+        batch = []
+
+    try:
+        with opener(src, "rt", encoding=encoding, errors="replace", newline="") as fh:
+            reader = csv.reader(fh, delimiter=delimiter)
+            for row in reader:
+                batch.append(
+                    json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+                )
+                rows += 1
+                if len(batch) >= 50_000:
+                    flush()
+        flush()
+    finally:
+        writer.close()
+
+    info = parquet_valid(tmp)
+    if info is None or info["rows"] != rows:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"invalid lossless CSV Parquet output for {src}")
+    os.replace(tmp, dst)
+    return {
+        **info,
+        "representation": "lossless-csv-row-json",
+        "encoding": encoding,
+        "delimiter": delimiter,
+    }
+
+def write_csv_arrow(src: Path, dst: Path, *, gzipped: bool = False) -> dict[str, Any]:
     header, delimiter = csv_header_and_delimiter(src, gzipped=gzipped)
     if not header:
         raise RuntimeError(f"CSV has no header: {src}")
@@ -328,6 +404,12 @@ def write_csv(src: Path, dst: Path, *, gzipped: bool = False) -> dict[str, Any]:
     os.replace(tmp, dst)
     return info
 
+
+def write_csv(src: Path, dst: Path, *, gzipped: bool = False) -> dict[str, Any]:
+    try:
+        return write_csv_arrow(src, dst, gzipped=gzipped)
+    except (pa.ArrowInvalid, UnicodeDecodeError, csv.Error):
+        return write_csv_lossless_rows(src, dst, gzipped=gzipped)
 
 def write_json_array_lossless(
     src: Path,
@@ -436,6 +518,71 @@ def write_json_array_lossless(
         "representation": "lossless-json-text",
     }
 
+def write_json_lines_lossless(
+    src: Path,
+    dst: Path,
+    *,
+    gzipped: bool = False,
+) -> dict[str, Any]:
+    """Stream JSONL records into one lossless JSON-text column."""
+    opener = gzip.open if gzipped else open
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+    schema = pa.schema([pa.field("json", pa.string(), nullable=False)])
+    writer = pq.ParquetWriter(
+        tmp,
+        schema,
+        compression="zstd",
+        compression_level=3,
+        use_dictionary=False,
+        write_statistics=True,
+    )
+    rows = 0
+    batch: list[str] = []
+    try:
+        with opener(src, "rt", encoding="utf-8-sig", errors="strict") as fh:
+            for lineno, line in enumerate(fh, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"invalid JSONL record at line {lineno}: {exc}"
+                    ) from exc
+                batch.append(
+                    json.dumps(
+                        obj,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=str,
+                    )
+                )
+                rows += 1
+                if len(batch) >= 50_000:
+                    table = pa.Table.from_arrays(
+                        [pa.array(batch, type=pa.string())],
+                        schema=schema,
+                    )
+                    writer.write_table(table, row_group_size=len(batch))
+                    batch = []
+            if batch:
+                table = pa.Table.from_arrays(
+                    [pa.array(batch, type=pa.string())],
+                    schema=schema,
+                )
+                writer.write_table(table, row_group_size=len(batch))
+    finally:
+        writer.close()
+
+    info = parquet_valid(tmp)
+    if info is None or info["rows"] != rows:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"invalid lossless JSONL Parquet output for {src}")
+    os.replace(tmp, dst)
+    return {**info, "representation": "lossless-json-text"}
+
 def write_json(src: Path, dst: Path, *, gzipped: bool = False) -> dict[str, Any]:
     import pyarrow.json as pajson
 
@@ -455,7 +602,7 @@ def write_json(src: Path, dst: Path, *, gzipped: bool = False) -> dict[str, Any]
     try:
         reader = pajson.open_json(
             source,
-            read_options=pajson.ReadOptions(block_size=16 * 1024 * 1024),
+            read_options=pajson.ReadOptions(block_size=64 * 1024 * 1024),
         )
         for batch in reader:
             if writer is None:
@@ -752,7 +899,16 @@ class Migrator:
                 if parquet_valid(target) is not None:
                     self.log(status="skip", source=str(src), output=str(target), kind=kind)
                     return
-                info = write_json(src, target, gzipped=kind == "json.gz")
+                try:
+                    info = write_json(src, target, gzipped=kind == "json.gz")
+                except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                    if json_layout(src, gzipped=kind == "json.gz") != "object-stream":
+                        raise
+                    info = write_json_lines_lossless(
+                        src,
+                        target,
+                        gzipped=kind == "json.gz",
+                    )
                 if info.pop("partial", False):
                     partial_output = info.pop("partial_output")
                     error = info.pop("error")
