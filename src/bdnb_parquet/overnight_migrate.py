@@ -1044,6 +1044,42 @@ def spreadsheetml_to_parquet(src: Path, dst: Path) -> dict[str, Any]:
         "representation": "spreadsheetml-row-json",
     }
 
+def write_binary_blob_lossless(src: Path, dst: Path) -> dict[str, Any]:
+    """Preserve an otherwise unsupported source exactly as one binary Parquet row."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+
+    data = src.read_bytes()
+    table = pa.Table.from_arrays(
+        [
+            pa.array([src.name], type=pa.string()),
+            pa.array([data], type=pa.binary()),
+        ],
+        names=["source_name", "data"],
+    )
+    pq.write_table(
+        table,
+        tmp,
+        compression="zstd",
+        compression_level=3,
+        use_dictionary=False,
+        write_statistics=True,
+    )
+
+    info = parquet_valid(tmp)
+    if info is None or info["rows"] != 1:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"invalid binary-blob Parquet output for {src}")
+
+    os.replace(tmp, dst)
+    return {
+        **info,
+        "representation": "lossless-binary-blob",
+        "source_bytes": len(data),
+    }
+
+
 def write_text_lines_lossless(src: Path, dst: Path) -> dict[str, Any]:
     """Store an arbitrary text export losslessly as one Parquet row per line."""
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1238,9 +1274,7 @@ def spreadsheet_to_parquet(src: Path, dst_dir: Path) -> list[dict[str, Any]]:
         try:
             info = write_text_lines_lossless(src, target)
         except (UnicodeDecodeError, RuntimeError):
-            raise RuntimeError(
-                f"spreadsheet extension does not match a supported Excel container: {src}"
-            )
+            info = write_binary_blob_lossless(src, target)
         return [{"sheet": "sheet1", "path": str(target), **info}]
 
     sheets = pd.read_excel(src, sheet_name=None, dtype=str, engine=engine)
@@ -1540,9 +1574,12 @@ class Migrator:
                 try:
                     info = write_geo(src, target)
                 except Exception:
-                    if kind != "geojson":
+                    if kind == "geojson":
+                        info = write_geojson_features_lossless(src, target)
+                    elif kind == "kml":
+                        info = write_binary_blob_lossless(src, target)
+                    else:
                         raise
-                    info = write_geojson_features_lossless(src, target)
                 if info.pop("partial", False):
                     partial_output = info.pop("partial_output")
                     error = info.pop("error")
