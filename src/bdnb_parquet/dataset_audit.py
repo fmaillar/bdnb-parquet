@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import sys
@@ -63,7 +64,43 @@ def is_dataset_boundary(base: Path, filenames: list[str], layer: str) -> bool:
     return False
 
 
-def scan_leaf_datasets(layer_root: Path, layer: str) -> list[Dataset]:
+def boundary_metadata(base: Path) -> tuple[int, int, str] | None:
+    """Read cheap aggregate metadata from canonical dataset markers.
+
+    Returns None when the marker does not contain enough aggregate information,
+    in which case the caller may fall back to a recursive filesystem scan.
+    """
+    candidates = [base / "dataset.json", base / "manifest.json"]
+    for marker in candidates:
+        if not marker.is_file():
+            continue
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        raw_bytes = data.get("bytes")
+        raw_files = data.get("files")
+        if raw_files is None:
+            ntriples_files = data.get("ntriples_files")
+            csv_files = data.get("csv_files")
+            if isinstance(ntriples_files, int) and isinstance(csv_files, int):
+                raw_files = ntriples_files + csv_files
+
+        if isinstance(raw_bytes, int) and isinstance(raw_files, int):
+            return raw_bytes, raw_files, ".parquet:manifest"
+
+    return None
+
+
+def scan_leaf_datasets(
+    layer_root: Path,
+    layer: str,
+    *,
+    fast: bool = False,
+) -> list[Dataset]:
     """Discover dataset roots without descending into known dataset internals.
 
     Canonical parquet datasets may contain many nested table directories, so
@@ -83,6 +120,15 @@ def scan_leaf_datasets(layer_root: Path, layer: str) -> list[Dataset]:
         dirnames[:] = [name for name in dirnames if not name.startswith(".")]
 
         if is_dataset_boundary(base, filenames, layer):
+            if fast and layer == "parquet":
+                meta = boundary_metadata(base)
+                if meta is not None:
+                    total, count, fmt = meta
+                    rel = base.relative_to(layer_root).as_posix()
+                    datasets.append(Dataset(layer, rel, total, count, fmt))
+                    dirnames[:] = []
+                    continue
+
             total = 0
             count = 0
             formats: Counter[str] = Counter()
@@ -436,6 +482,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help=(
+            "use aggregate dataset.json/manifest.json metadata for canonical "
+            "Parquet boundaries instead of recursively rescanning their files"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -443,7 +497,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     root = args.root.expanduser().resolve()
     datasets = {
-        layer: scan_leaf_datasets(root / layer, layer)
+        layer: scan_leaf_datasets(root / layer, layer, fast=args.fast)
         for layer in LAYERS
     }
     rows = build_rows(datasets)
