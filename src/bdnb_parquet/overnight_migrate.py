@@ -998,6 +998,10 @@ def retry_sources_from_log(
     """Return existing top-level raw sources whose latest status/kind is selected."""
     latest: dict[str, tuple[str, str]] = {}
     raw_prefix = str(raw_root.resolve()) + os.sep
+    log_statuses = {
+        "unsupported" if status == "ignored" else status
+        for status in statuses
+    }
 
     with log_path.open("r", encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, start=1):
@@ -1024,7 +1028,7 @@ def retry_sources_from_log(
     selected: list[Path] = []
     missing: list[str] = []
     for source, (status, kind) in latest.items():
-        if status not in statuses:
+        if status not in log_statuses:
             continue
         if kinds is not None and kind not in kinds:
             continue
