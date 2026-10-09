@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import hashlib
 import json
@@ -127,11 +128,12 @@ def build(
     *,
     checksum: bool,
     reuse: dict[str, Entry] | None = None,
+    workers: int = 1,
 ) -> tuple[list[Entry], list[dict[str, str]], int, int]:
     entries: list[Entry] = []
     errors: list[dict[str, str]] = []
     reused = 0
-    inspected = 0
+    to_inspect: list[Path] = []
 
     for path in sorted(root.rglob("*.parquet")):
         rel = path.relative_to(root).as_posix()
@@ -146,10 +148,8 @@ def build(
             if can_reuse:
                 entries.append(previous)
                 reused += 1
-                continue
-
-            entries.append(inspect(path, root, checksum=checksum))
-            inspected += 1
+            else:
+                to_inspect.append(path)
         except Exception as exc:
             errors.append(
                 {
@@ -157,7 +157,40 @@ def build(
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
-    return entries, errors, reused, inspected
+
+    if workers <= 1:
+        for path in to_inspect:
+            rel = path.relative_to(root).as_posix()
+            try:
+                entries.append(inspect(path, root, checksum=checksum))
+            except Exception as exc:
+                errors.append(
+                    {
+                        "path": rel,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(inspect, path, root, checksum=checksum): path
+                for path in to_inspect
+            }
+            for future in as_completed(futures):
+                path = futures[future]
+                rel = path.relative_to(root).as_posix()
+                try:
+                    entries.append(future.result())
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "path": rel,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+
+    entries.sort(key=lambda e: e.path)
+    return entries, errors, reused, len(to_inspect)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -177,7 +210,15 @@ def main(argv: list[str] | None = None) -> int:
             "file size are unchanged"
         ),
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="parallel file inspections; use 3 on the HDD-backed m710s",
+    )
     args = parser.parse_args(argv)
+    if args.workers <= 0:
+        parser.error("--workers must be positive")
 
     root = args.root.expanduser().resolve()
     reuse = load_manifest(args.reuse.expanduser().resolve()) if args.reuse else None
@@ -185,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
         root,
         checksum=args.checksum,
         reuse=reuse,
+        workers=args.workers,
     )
 
     total_bytes = sum(e.bytes for e in entries)
