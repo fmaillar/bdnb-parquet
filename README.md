@@ -438,3 +438,41 @@ bdnb-parquet-compact-publish \
 datasets in the 322-GiB corpus are untouched. Existing snapshot-level
 manifest/checksum/torrent metadata outside BDNB may now be stale and must
 be rebuilt **before** creating or seeding the replacement torrent.
+
+## One-command full BDNB compaction (recommended for the verified 2026-02-a dataset)
+
+After reviewing the original BDNB converter provenance, use one command instead
+of multiple pilot approvals. This validates the original `_SUCCESS.json` and
+planner, selects **every** eligible BDNB candidate batch, runs 4 independent
+worker processes × 2 PyArrow threads, fully verifies each batch, stages a
+hardlinked replacement dataset, regenerates BDNB manifests and then deletes
+redundant original Parquet fragments **only after published validation**.
+
+```bash
+bdnb-parquet-compact-all \
+  --plan-dir /mnt/data/parquet-compaction-plan \
+  --source-root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet \
+  --output-root /mnt/data/parquet-compaction-scheduled \
+  --tables-root "territoire-geospatial/cadastre/batiments/base-donnees-nationale/bdnb_2026_02_a_open_data/tables" \
+  --workers 4 \
+  --threads 2 \
+  --execute \
+  --prune-originals
+```
+
+This one call deliberately replaces the BDNB dataset subtree in the existing
+snapshot. The old directory is renamed to a backup during promotion and its
+obsolete part files are **permanently removed** once the new tree passes
+verification. Uncompacted singleton Parquet files remain available (with
+new part filenames as appropriate), and the output staging tree is kept for
+audit. If the machine stops unexpectedly during promotion, the backup is
+left intact and the command refuses a further attempt until recovery.
+
+Omit `--execute --prune-originals` to preview the original table counts and
+candidate batches without modifying any data. Use `--execute` without
+`--prune-originals` to preserve the complete pre-compaction BDNB backup.
+
+**Only the BDNB dataset is compacted by this command** (not the full 322 GiB
+mixed-source corpus). Snapshot-level indexes, file hashes and torrent metadata
+outside the BDNB dataset must be regenerated after publication.
+
