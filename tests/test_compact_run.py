@@ -3,12 +3,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from bdnb_parquet.compact_parquet import MIB, plan, scan, write_report
 from bdnb_parquet.compact_run import (
+    arrow_cpu_threads,
     compare_rows,
     execute,
     main,
@@ -78,6 +80,78 @@ class CompactionRunnerTests(unittest.TestCase):
         self.assertEqual(
             len(list(self.source.rglob("*.parquet"))), 4
         )
+
+    def test_multi_threaded_decode_and_timing_report(self):
+        selected = self.selection()
+        result = execute(
+            selected, self.destination, batch_rows=2, zstd_level=3,
+            threads=4, row_group_rows=5, max_buffer_mib=1,
+        )
+        output, report = output_paths(self.destination, selected)
+        self.assertEqual(result["verified_rows"], 12)
+        self.assertEqual(result["threads"], 4)
+        self.assertEqual(result["execution_mode"], "new-output")
+        self.assertGreaterEqual(result["write_seconds"], 0)
+        self.assertGreaterEqual(result["verify_seconds"], 0)
+        self.assertGreaterEqual(result["total_seconds"], 0)
+        self.assertIsNotNone(result["write_source_mib_per_sec"])
+        self.assertIsNotNone(result["verify_source_mib_per_sec"])
+        self.assertEqual(result, json.loads(report.read_text()))
+        self.assertEqual(
+            compare_rows(
+                tuple(item.path for item in selected.sources),
+                output,
+                batch_rows=3,
+                threads=4,
+            ), 12,
+        )
+
+    def test_new_output_verifies_once_but_resume_reverifies(self):
+        selected = self.selection(max_files=2)
+        from bdnb_parquet import compact_run
+
+        original_verify = compact_run.verify
+        with patch.object(
+            compact_run, "verify", wraps=original_verify
+        ) as checked:
+            first = execute(
+                selected, self.destination, batch_rows=2,
+                zstd_level=3, threads=2,
+            )
+            self.assertEqual(checked.call_count, 1)
+            self.assertEqual(first["execution_mode"], "new-output")
+            checked.reset_mock()
+            resumed = execute(
+                selected, self.destination, batch_rows=2,
+                zstd_level=3, threads=2,
+            )
+            self.assertEqual(checked.call_count, 1)
+            self.assertEqual(
+                resumed["execution_mode"], "existing-output-verification"
+            )
+            self.assertEqual(resumed["write_seconds"], 0.0)
+
+    def test_arrow_cpu_thread_limit_is_restored(self):
+        previous = pa.cpu_count()
+        with arrow_cpu_threads(2):
+            self.assertEqual(pa.cpu_count(), 2)
+        self.assertEqual(pa.cpu_count(), previous)
+        with self.assertRaises(ValueError):
+            with arrow_cpu_threads(0):
+                pass
+
+    def test_invalid_threads_cli(self):
+        args = [
+            "--plan-dir", str(self.plan_dir),
+            "--source-root", str(self.source),
+            "--output-root", str(self.destination),
+            "--batch-id", self.batch_id,
+            "--threads", "0",
+        ]
+        with self.assertRaises(SystemExit) as error:
+            main(args)
+        self.assertEqual(error.exception.code, 2)
+        self.assertFalse(self.destination.exists())
 
     def test_row_groups_span_input_batch_and_file_boundaries(self):
         selected = self.selection()
