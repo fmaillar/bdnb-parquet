@@ -318,18 +318,17 @@ separate output trees before tuning or launching corpus-wide work.
 
 ## BDNB multi-batch compaction scheduler (experimental)
 
-The `bdnb-parquet-compact-schedule` entry point chooses only compatible
-`review-required` plan batches in explicitly selected BDNB table directories.
-**Dry-run is the default; no Parquet output is created without `--execute`.**
-The planner/runner PRs must be installed before using this command.
+The `bdnb-parquet-compact-schedule` command reuses the read-only planner.
+It **never modifies the source Parquet corpus** and requires `--execute`
+before writing compacted outputs. First inventory and review BDNB tables.
 
-Set your specific BDNB table root (path relative to `--source-root`):
+Set your corpus-specific table directory:
 
 ```bash
 BDNB_TABLES='territoire-geospatial/cadastre/batiments/base-donnees-nationale/bdnb_2026_02_a_open_data/tables'
 ```
 
-Preview one batch, changing no files:
+### 1. Inventory BDNB tables (no compaction)
 
 ```bash
 bdnb-parquet-compact-schedule \
@@ -337,33 +336,58 @@ bdnb-parquet-compact-schedule \
   --source-root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet \
   --output-root /mnt/data/parquet-compaction-scheduled \
   --tables-root "$BDNB_TABLES" \
-  --table batiment_groupe_hthd \
-  --max-batches 1
+  --inventory > /tmp/bdnb-table-review.tsv
 ```
 
-After reviewing the selected batch IDs, add `--execute` to run the single
-approved batch. The defaults are `--workers 1`, `--threads 4`,
-`--max-batches 1`, and `--min-free-gib 20`. The scheduler refuses batches
-with filename patterns other than consecutive `part-NNNNN.parquet` pieces;
-it never combines different table directories or exact Arrow schemas.
+The inventory TSV includes candidate batch/file/row totals, compressed MiB,
+schema variants and blocked candidate batches per table. The `approved`
+and `reason` columns are initially blank. A table with zero blocked batches
+is *technically eligible* but NOT automatically semantically approved.
 
-To test **two independent table batches concurrently**, explicitly select
-two different table names and run with `--workers 2 --max-batches 2 --execute`.
-Process isolation avoids contention over the process-wide Arrow CPU pool.
-The limit of two workers is intentional for HDD-based execution.
+Review each table's actual data semantics, source provenance, part naming,
+row ordering and partitions. For each accepted table, set `approved` to
+`yes` and supply a nonempty `reason` (no tabs or newlines). Leave all other
+tables blank or `no`. Check the `other_batches` field for noncompactable
+files in that same table directory.
 
-A durable JSONL event log is written under
-`<output-root>/_meta/compaction-journal.jsonl`. The latest run summary is
-`<output-root>/_meta/last-run.json`. A stopped run is restarted using the
-same command: each existing output is fully reverified rather than blindly
-trusted or overwritten. The runner retains a per-output JSON provenance
-report and never deletes or rewrites the source files.
+### 2. Preview only approved tables
 
-Disk-space checks reserve the configured free-space floor plus approximate
-space for simultaneous staged outputs. These checks are *heuristics*, not
-disk quotas; monitor actual free space and RAM during experiments.
+```bash
+bdnb-parquet-compact-schedule \
+  --plan-dir /mnt/data/parquet-compaction-plan \
+  --source-root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet \
+  --output-root /mnt/data/parquet-compaction-scheduled \
+  --tables-root "$BDNB_TABLES" \
+  --approved-tables /tmp/bdnb-table-review.tsv \
+  --max-batches 4 \
+  --workers 4 \
+  --threads 4
+```
 
-**Do not enable `--all-tables` for the complete dataset before semantic
-review of its table inventory.** The scheduler does not resolve source-level
-provenance encoded only in filenames, does not update `_SUCCESS.json` or
-release manifests, and does not publish or remove any original files.
+This only displays candidate batch IDs and paths. Add `--execute` only
+after reviewing the selection.
+
+Defaults: `--workers 1`, `--threads 4`, `--max-batches 1`,
+`--min-free-gib 20`. Workers 2, 3 and 4 use separate processes and Arrow
+CPU thread pools. Four processes × four threads requires HDD/CPU/RAM
+monitoring and is not guaranteed faster than two processes.
+
+Repeatable `--table NAME` is also an explicit selector. `--all-tables` is
+**preview-only** and cannot be combined with `--execute`. Review TSVs
+cannot approve blocked candidates or omit a review reason. Plans and real
+source metadata are validated again before any newly compacted output.
+
+### 3. Journal and recovery
+
+The fsync'ed JSONL journal is
+`<output-root>/_meta/compaction-journal.jsonl`; the latest summary is
+`<output-root>/_meta/last-run.json`. Restart with the same command:
+previous outputs are reverified in full, never blindly trusted or overwritten.
+Per-output JSON audit reports retain source paths and verification results.
+
+The source files are never deleted. Disk checks reserve the free-space
+floor and an estimated staging budget (twice the largest concurrent
+compressed input batches); this is a heuristic, not a hard quota.
+Source-level semantic/provenance review remains required before publishing
+any derivative corpus. `_SUCCESS.json`, release manifests and torrents
+are not modified.
