@@ -8,6 +8,7 @@ import pyarrow.parquet as pq
 
 from bdnb_parquet.compact_parquet import MIB, plan, scan, write_report
 from bdnb_parquet.compact_publish import main, publish
+from bdnb_parquet.compact_all import main as compact_all_main
 from bdnb_parquet.compact_run import (
     execute, read_selection,
 )
@@ -166,6 +167,39 @@ class PublishCompactionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "previously interrupted"):
             publish(**self.kwargs(), prune_backup=True)
         self.assertTrue((self.tables / "many" / "part-00001.parquet").exists())
+
+    def test_all_in_one_run_and_prune(self):
+        args = [
+            "--plan-dir", str(self.plan_dir),
+            "--source-root", str(self.root),
+            "--output-root", str(self.output_root),
+            "--tables-root", self.tables_root,
+            "--workers", "2", "--threads", "2",
+            "--min-free-gib", "0",
+        ]
+        self.assertEqual(compact_all_main(args), 0)
+        self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 4)
+        self.assertFalse(self.output_root.exists())
+        self.assertEqual(
+            compact_all_main(args + ["--execute", "--prune-originals"]), 0
+        )
+        self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 2)
+        self.assertFalse(
+            self.dataset.with_name("bdnb.precompact-backup").exists()
+        )
+        self.assertTrue((self.dataset / "_COMPACTION.json").exists())
+
+    def test_all_in_one_refuses_prune_without_execute(self):
+        args = [
+            "--plan-dir", str(self.plan_dir),
+            "--source-root", str(self.root),
+            "--output-root", str(self.output_root),
+            "--tables-root", self.tables_root,
+            "--prune-originals",
+        ]
+        with self.assertRaises(SystemExit):
+            compact_all_main(args)
+        self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 4)
 
     def test_cli_requires_explicit_execute(self):
         args = [
