@@ -32,7 +32,6 @@ from .compact_run import (
     execute,
     read_selection,
     reject_overlapping_trees,
-    relative_directory_path,
 )
 
 MIB = 2**20
@@ -275,28 +274,35 @@ def run_schedule(
             stop = False
 
             def enqueue() -> bool:
+                nonlocal stop
                 try:
                     selected = next(iterator)
                 except StopIteration:
                     return False
-                check_disk_budget(
-                    output_root,
-                    [*inflight.values(), selected],
-                    workers,
-                    min_free_gib,
-                )
-                append_event(journal, {
-                    "event": "start", "batch_id": selected.batch_id
-                })
-                future = pool.submit(
-                    run_one, selected, output_root, threads,
-                    batch_rows, row_group_rows, max_buffer_mib, zstd_level,
-                )
-                inflight[future] = selected
-                return True
+                try:
+                    check_disk_budget(
+                        output_root,
+                        [*inflight.values(), selected],
+                        workers,
+                        min_free_gib,
+                    )
+                    append_event(journal, {
+                        "event": "start", "batch_id": selected.batch_id
+                    })
+                    future = pool.submit(
+                        run_one, selected, output_root, threads,
+                        batch_rows, row_group_rows, max_buffer_mib, zstd_level,
+                    )
+                    inflight[future] = selected
+                    return True
+                except Exception as exc:
+                    record_error(selected, exc)
+                    stop = True
+                    return False
 
             for _ in range(min(workers, len(selections))):
-                enqueue()
+                if stop or not enqueue():
+                    break
             while inflight:
                 done, _ = wait(inflight, return_when=FIRST_COMPLETED)
                 for future in done:
