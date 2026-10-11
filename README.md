@@ -244,3 +244,46 @@ actual compaction.
 This phase does not estimate storage savings and does not validate row values.
 The next phase will implement streamed writing and integrity verification
 in a separate output tree after an explicit plan has been approved.
+
+## Experimental streaming compaction: single batch
+
+After reviewing a `bdnb-parquet-compact` plan, compact a single batch into a
+**separate output tree**. The input files are never moved, overwritten or
+deleted. All Arrow values are compared in source order with the result.
+
+Start with the first ten parts of the BDNB `batiment_groupe_hthd` batch:
+
+```bash
+bdnb-parquet-compact-run \
+  --plan-dir /mnt/data/parquet-compaction-plan \
+  --source-root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet \
+  --output-root /mnt/data/parquet-compaction-pilot \
+  --batch-id d1d1ac9f87edca61f1e292eff7d247413af32fb09e5f8b43b89ab5c443f50af7-0001 \
+  --max-files 10 \
+  --batch-rows 16384 \
+  --zstd-level 3
+```
+
+`--max-files 10` is a **pilot**: the output filename includes `pilot-10`,
+so it cannot be confused with the full 263-part batch. Without
+`--max-files`, all source files listed for that batch are processed.
+
+Before writing, each source's size, footer row count, and serialized Arrow
+schema are compared with the saved plan. Parquet is read and written using
+bounded RecordBatches, with ZSTD compression (level 3 by default).
+Before promoting the temporary output, the runner reopens it, checks its
+schema and row count, and compares **every logical Arrow value in order**
+against all selected source files. Only a verified output is atomically
+renamed into place, followed by a JSON audit report alongside it.
+
+On restart, if the output already exists, it is reverified instead of being
+rewritten. Use `--verify-only` to check an existing output without creating
+one. A malformed plan, changed source, or mismatching data stops the run.
+
+Limitations: this experimental command processes a **single manually reviewed
+batch**. It cannot establish dataset semantic equivalence from schemas alone;
+date or provenance encoded solely in source filenames may be lost in the
+merged Parquet data, although all input paths are retained in the sidecar
+JSON report. It does not update BDNB `_SUCCESS.json` or release manifests,
+and it never removes original Parquet files. No automatic corpus-wide
+compaction or publication is performed.
