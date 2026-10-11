@@ -11,15 +11,22 @@ import csv
 import json
 import multiprocessing
 import os
-import re
 import shutil
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .compact_inventory import (
+    PART_PATTERN,
+    TABLE_PATTERN,
+    checked_tables_root,
+    read_approved_tables,
+    table_inventory,
+    write_inventory,
+)
 from .compact_run import (
     Selection,
     execute,
@@ -28,8 +35,6 @@ from .compact_run import (
     relative_directory_path,
 )
 
-PART_PATTERN = re.compile(r"part-(\d{5,})\.parquet\Z")
-TABLE_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\Z")
 MIB = 2**20
 GIB = 2**30
 DEFAULT_THREADS = 4
@@ -53,11 +58,7 @@ def load_candidates(
         raise ValueError("Use either --table or --all-tables, not both")
     if any(not TABLE_PATTERN.fullmatch(name) for name in tables):
         raise ValueError("Invalid table name")
-    base = relative_directory_path(tables_root)
-    if base == Path("."):
-        raise ValueError("--tables-root must identify an explicit tables directory")
-    if base.name != "tables":
-        raise ValueError("--tables-root must end with /tables")
+    base = checked_tables_root(tables_root)
 
     with (plan_dir / "batches.tsv").open(
         newline="", encoding="utf-8"
@@ -189,8 +190,8 @@ def run_schedule(
     min_free_gib: int,
 ) -> dict[str, Any]:
     """Execute independently verified batches; journal before and after each."""
-    if not 1 <= workers <= 2:
-        raise ValueError("--workers must be 1 or 2 on the HDD-safe scheduler")
+    if not 1 <= workers <= 4:
+        raise ValueError("--workers must be in [1, 4]")
     if threads < 1:
         raise ValueError("--threads must be positive")
     budget = check_disk_budget(
@@ -264,7 +265,7 @@ def run_schedule(
                 break
     else:
         # Spawn isolates Arrow's process-global thread pool per worker.
-        # Only two bounded, independent jobs can be in-flight.
+        # At most four bounded, independent jobs can be in-flight.
         with ProcessPoolExecutor(
             max_workers=workers,
             mp_context=multiprocessing.get_context("spawn"),
@@ -278,7 +279,12 @@ def run_schedule(
                     selected = next(iterator)
                 except StopIteration:
                     return False
-                check_disk_budget(output_root, [selected], workers, min_free_gib)
+                check_disk_budget(
+                    output_root,
+                    [*inflight.values(), selected],
+                    workers,
+                    min_free_gib,
+                )
                 append_event(journal, {
                     "event": "start", "batch_id": selected.batch_id
                 })
@@ -291,7 +297,6 @@ def run_schedule(
 
             for _ in range(min(workers, len(selections))):
                 enqueue()
-            from concurrent.futures import FIRST_COMPLETED, wait
             while inflight:
                 done, _ = wait(inflight, return_when=FIRST_COMPLETED)
                 for future in done:
@@ -344,11 +349,19 @@ def main(argv: list[str] | None = None) -> int:
     selector = parser.add_mutually_exclusive_group(required=True)
     selector.add_argument("--table", action="append", dest="tables")
     selector.add_argument("--all-tables", action="store_true")
+    selector.add_argument(
+        "--approved-tables", type=Path,
+        help="TSV inventory edited with approved=yes and documented review reason",
+    )
+    selector.add_argument(
+        "--inventory", action="store_true",
+        help="print all planned BDNB tables as a reviewable TSV; no output changes",
+    )
     parser.add_argument(
         "--max-batches", type=int, default=1,
         help="maximum batches this run may process (default: 1)",
     )
-    parser.add_argument("--workers", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--workers", type=int, choices=(1, 2, 3, 4), default=1)
     parser.add_argument("--threads", type=int, default=DEFAULT_THREADS)
     parser.add_argument("--batch-rows", type=int, default=16384)
     parser.add_argument("--row-group-rows", type=int, default=100000)
@@ -374,9 +387,24 @@ def main(argv: list[str] | None = None) -> int:
     try:
         reject_overlapping_trees(source, output)
         reject_overlapping_trees(plan_dir, output)
+        if args.inventory:
+            if args.execute:
+                raise ValueError("--inventory cannot be combined with --execute")
+            write_inventory(sys.stdout, table_inventory(plan_dir, args.tables_root))
+            return 0
+        if args.all_tables and args.execute:
+            raise ValueError(
+                "--all-tables is preview-only; use --approved-tables or --table "
+                "for explicit execution approval"
+            )
+        allowed = (
+            read_approved_tables(args.approved_tables)
+            if args.approved_tables is not None
+            else set(args.tables or [])
+        )
         selections = load_candidates(
             plan_dir, source, args.tables_root,
-            set(args.tables or []),
+            allowed,
             all_tables=args.all_tables,
             limit=args.max_batches,
         )
