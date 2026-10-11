@@ -13,6 +13,8 @@ import json
 import os
 import re
 import sys
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterator
@@ -169,21 +171,39 @@ def inspect_sources(selection: Selection) -> pa.Schema:
     return reference
 
 
-def batches(paths: tuple[Path, ...], batch_rows: int) -> Iterator[pa.RecordBatch]:
+@contextmanager
+def arrow_cpu_threads(threads: int) -> Iterator[None]:
+    """Configure Arrow's process-global CPU pool during a single CLI run."""
+    if threads < 1:
+        raise ValueError("--threads must be positive")
+    previous = pa.cpu_count()
+    try:
+        if threads != previous:
+            pa.set_cpu_count(threads)
+        yield
+    finally:
+        if threads != previous:
+            pa.set_cpu_count(previous)
+
+
+def batches(
+    paths: tuple[Path, ...], batch_rows: int, threads: int = 1
+) -> Iterator[pa.RecordBatch]:
     for path in paths:
         parquet = pq.ParquetFile(path)
         try:
-            yield from parquet.iter_batches(batch_size=batch_rows, use_threads=False)
+            yield from parquet.iter_batches(batch_size=batch_rows, use_threads=threads > 1)
         finally:
             parquet.close()
 
 
 def compare_rows(
-    original: tuple[Path, ...], output: Path, batch_rows: int
+    original: tuple[Path, ...], output: Path, batch_rows: int,
+    threads: int = 1,
 ) -> int:
     """Compare all logical Arrow values in order, regardless of batch boundaries."""
-    left = iter(batches(original, batch_rows))
-    right = iter(batches((output,), batch_rows))
+    left = iter(batches(original, batch_rows, threads))
+    right = iter(batches((output,), batch_rows, threads))
     first = next(left, None)
     second = next(right, None)
     left_offset = right_offset = rows = 0
@@ -208,7 +228,10 @@ def compare_rows(
         right_offset += n
 
 
-def verify(selection: Selection, output: Path, batch_rows: int) -> int:
+def verify(
+    selection: Selection, output: Path, batch_rows: int,
+    threads: int = 1,
+) -> int:
     schema = inspect_sources(selection)
     parquet = pq.ParquetFile(output)
     try:
@@ -221,7 +244,7 @@ def verify(selection: Selection, output: Path, batch_rows: int) -> int:
         parquet.close()
 
     verified = compare_rows(
-        tuple(item.path for item in selection.sources), output, batch_rows
+        tuple(item.path for item in selection.sources), output, batch_rows, threads
     )
     if verified != expected:
         raise ValueError("Verified row count differs")
@@ -236,6 +259,7 @@ def write_stream(
     zstd_level: int,
     row_group_rows: int,
     max_buffer_mib: int,
+    threads: int = 1,
 ) -> int:
     """Buffer small read batches into larger Parquet row groups.
 
@@ -270,7 +294,7 @@ def write_stream(
             parquet = pq.ParquetFile(item.path)
             try:
                 for batch in parquet.iter_batches(
-                    batch_size=batch_rows, use_threads=False
+                    batch_size=batch_rows, use_threads=threads > 1
                 ):
                     total += batch.num_rows
                     offset = 0
@@ -342,69 +366,110 @@ def execute(
     zstd_level: int, verify_only: bool = False,
     row_group_rows: int = DEFAULT_ROW_GROUP_ROWS,
     max_buffer_mib: int = DEFAULT_MAX_BUFFER_MIB,
+    threads: int = 1,
 ) -> dict[str, object]:
-    if row_group_rows <= 0 or max_buffer_mib <= 0:
-        raise ValueError("Row group size and buffer budget must be positive")
-    schema = inspect_sources(selection)
-    target, report = output_paths(output_root, selection)
-    if not target.exists() and verify_only:
-        raise FileNotFoundError(f"No compacted output to verify: {target}")
-    if report.exists() and not target.exists():
-        raise RuntimeError(f"Report exists without compacted output: {report}")
+    if row_group_rows <= 0 or max_buffer_mib <= 0 or batch_rows <= 0:
+        raise ValueError("Row group size, batch size and buffer budget must be positive")
+    if threads < 1:
+        raise ValueError("--threads must be positive")
 
-    if target.exists():
-        if not target.is_file() or target.is_symlink():
-            raise ValueError(f"Output is not a regular file: {target}")
-        if report.exists():
-            saved = json.loads(report.read_text(encoding="utf-8"))
-            if (saved.get("batch_id") != selection.batch_id
-                or saved.get("source_paths") != [x.relative for x in selection.sources]):
-                raise ValueError("Existing report does not match current source selection")
-    else:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if not target.parent.resolve().is_relative_to(output_root):
-            raise ValueError("Output parent directory escapes output tree")
-        stage = target.with_suffix(".partial")
-        if stage.is_symlink():
-            raise ValueError("Staging file must not be a symbolic link")
-        try:
-            write_stream(
-                selection, stage, schema, batch_rows, zstd_level,
-                row_group_rows, max_buffer_mib,
-            )
-            print("VERIFY: comparing all source values with staged output", file=sys.stderr, flush=True)
-            verified = verify(selection, stage, batch_rows)
-            os.replace(stage, target)
-        finally:
-            stage.unlink(missing_ok=True)
+    started = time.perf_counter()
+    with arrow_cpu_threads(threads):
+        schema = inspect_sources(selection)
+        target, report = output_paths(output_root, selection)
+        if not target.exists() and verify_only:
+            raise FileNotFoundError(f"No compacted output to verify: {target}")
+        if report.exists() and not target.exists():
+            raise RuntimeError(f"Report exists without compacted output: {report}")
 
-    # Always verify even when resuming an existing output.
-    print("VERIFY: checking published output", file=sys.stderr, flush=True)
-    verified = verify(selection, target, batch_rows)
-    output_metadata = pq.read_metadata(target)
-    group_lengths = [
-        output_metadata.row_group(i).num_rows
-        for i in range(output_metadata.num_row_groups)
-    ]
-    result: dict[str, object] = {
-        "batch_id": selection.batch_id,
-        "pilot": selection.pilot,
-        "planned_files": selection.planned_files,
-        "source_files": len(selection.sources),
-        "source_paths": [x.relative for x in selection.sources],
-        "source_rows": sum(item.rows for item in selection.sources),
-        "verified_rows": verified,
-        "source_bytes": sum(item.bytes for item in selection.sources),
-        "output_bytes": target.stat().st_size,
-        "output_row_groups": len(group_lengths),
-        "output_min_row_group_rows": min(group_lengths, default=0),
-        "output_max_row_group_rows": max(group_lengths, default=0),
-        "output": str(target),
-        "codec": "zstd",
-        "validation": "full-ordered-Arrow-record-batch-equality",
-    }
-    atomic_report(report, result)
-    return result
+        write_seconds = 0.0
+        verification_seconds = 0.0
+        if target.exists():
+            mode = "existing-output-verification"
+            if not target.is_file() or target.is_symlink():
+                raise ValueError(f"Output is not a regular file: {target}")
+            if report.exists():
+                saved = json.loads(report.read_text(encoding="utf-8"))
+                if (
+                    saved.get("batch_id") != selection.batch_id
+                    or saved.get("source_paths")
+                    != [x.relative for x in selection.sources]
+                ):
+                    raise ValueError(
+                        "Existing report does not match current source selection"
+                    )
+            # Resume/--verify-only MUST rescan all logical values.
+            print("VERIFY: checking existing output", file=sys.stderr, flush=True)
+            verifying = time.perf_counter()
+            verified = verify(selection, target, batch_rows, threads)
+            verification_seconds = time.perf_counter() - verifying
+        else:
+            mode = "new-output"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.parent.resolve().is_relative_to(output_root):
+                raise ValueError("Output parent directory escapes output tree")
+            stage = target.with_suffix(".partial")
+            if stage.is_symlink():
+                raise ValueError("Staging file must not be a symbolic link")
+            try:
+                writing = time.perf_counter()
+                write_stream(
+                    selection, stage, schema, batch_rows, zstd_level,
+                    row_group_rows, max_buffer_mib, threads,
+                )
+                write_seconds = time.perf_counter() - writing
+
+                # One complete verification is sufficient: os.replace moves
+                # the same verified file without re-encoding any data.
+                print(
+                    "VERIFY: comparing all source values with staged output",
+                    file=sys.stderr, flush=True,
+                )
+                verifying = time.perf_counter()
+                verified = verify(selection, stage, batch_rows, threads)
+                verification_seconds = time.perf_counter() - verifying
+                os.replace(stage, target)
+            finally:
+                stage.unlink(missing_ok=True)
+
+        output_metadata = pq.read_metadata(target)
+        group_lengths = [
+            output_metadata.row_group(i).num_rows
+            for i in range(output_metadata.num_row_groups)
+        ]
+        source_bytes = sum(item.bytes for item in selection.sources)
+        elapsed = time.perf_counter() - started
+        result: dict[str, object] = {
+            "batch_id": selection.batch_id,
+            "pilot": selection.pilot,
+            "planned_files": selection.planned_files,
+            "source_files": len(selection.sources),
+            "source_paths": [x.relative for x in selection.sources],
+            "source_rows": sum(item.rows for item in selection.sources),
+            "verified_rows": verified,
+            "source_bytes": source_bytes,
+            "output_bytes": target.stat().st_size,
+            "output_row_groups": len(group_lengths),
+            "output_min_row_group_rows": min(group_lengths, default=0),
+            "output_max_row_group_rows": max(group_lengths, default=0),
+            "output": str(target),
+            "codec": "zstd",
+            "threads": threads,
+            "execution_mode": mode,
+            "write_seconds": round(write_seconds, 3),
+            "verify_seconds": round(verification_seconds, 3),
+            "total_seconds": round(elapsed, 3),
+            # Logical source-byte throughput, not physical HDD throughput.
+            "write_source_mib_per_sec": round(
+                source_bytes / MIB / write_seconds, 3
+            ) if write_seconds > 0 else None,
+            "verify_source_mib_per_sec": round(
+                source_bytes / MIB / verification_seconds, 3
+            ) if verification_seconds > 0 else None,
+            "validation": "full-ordered-Arrow-record-batch-equality",
+        }
+        atomic_report(report, result)
+        return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -428,6 +493,10 @@ def main(argv: list[str] | None = None) -> int:
         "--max-buffer-mib", type=int, default=DEFAULT_MAX_BUFFER_MIB,
         help="approximate limit on pending uncompressed Arrow bytes (default: 128 MiB)",
     )
+    parser.add_argument(
+        "--threads", type=int, default=1,
+        help="Arrow column decoding threads (default: 1; try 4 on the m710s)",
+    )
     parser.add_argument("--zstd-level", type=int, default=3)
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args(argv)
@@ -440,6 +509,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--max-buffer-mib must be positive")
     if not 1 <= args.zstd_level <= 19:
         parser.error("--zstd-level must be in [1, 19]")
+    if args.threads < 1:
+        parser.error("--threads must be positive")
     source = args.source_root.expanduser().resolve()
     plan_dir = args.plan_dir.expanduser().resolve()
     output = args.output_root.expanduser().resolve()
@@ -452,6 +523,7 @@ def main(argv: list[str] | None = None) -> int:
             verify_only=args.verify_only,
             row_group_rows=args.row_group_rows,
             max_buffer_mib=args.max_buffer_mib,
+            threads=args.threads,
         )
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
