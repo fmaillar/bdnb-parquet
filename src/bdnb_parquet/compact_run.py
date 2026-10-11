@@ -178,26 +178,19 @@ def compare_rows(
     second = next(right, None)
     left_offset = right_offset = rows = 0
     while True:
+        # Normalize iteration before testing exhaustion: adjacent Parquet
+        # files and row groups can yield different RecordBatch boundaries.
+        if first is not None and left_offset >= first.num_rows:
+            first = next(left, None)
+            left_offset = 0
+        if second is not None and right_offset >= second.num_rows:
+            second = next(right, None)
+            right_offset = 0
         if first is None or second is None:
             if first is not None or second is not None:
                 raise ValueError(f"Row count differs at row {rows}")
             return rows
-        if first.num_rows == left_offset:
-            first = next(left, None)
-            left_offset = 0
-            continue
-        if second.num_rows == right_offset:
-            second = next(right, None)
-            right_offset = 0
-            continue
         n = min(first.num_rows - left_offset, second.num_rows - right_offset)
-        if n == 0:
-            # Handle empty batches without looping indefinitely.
-            if first.num_rows == 0:
-                first = next(left, None)
-            if second.num_rows == 0:
-                second = next(right, None)
-            continue
         if not first.slice(left_offset, n).equals(second.slice(right_offset, n)):
             raise ValueError(f"Parquet values differ starting near row {rows}")
         rows += n
