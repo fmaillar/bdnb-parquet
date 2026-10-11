@@ -502,8 +502,8 @@ def main(argv: list[str] | None = None) -> int:
         help="approximate limit on pending uncompressed Arrow bytes (default: 128 MiB)",
     )
     parser.add_argument(
-        "--threads", type=int, default=1,
-        help="Arrow column decoding threads (default: 1; try 4 on the m710s)",
+        "--threads", type=int, default=4,
+        help="Arrow column decoding threads (default: 4)",
     )
     parser.add_argument("--zstd-level", type=int, default=3)
     parser.add_argument("--verify-only", action="store_true")
