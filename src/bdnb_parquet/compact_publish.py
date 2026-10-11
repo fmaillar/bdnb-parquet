@@ -79,7 +79,13 @@ def inspect_plan(
         if not path.is_relative_to(dataset):
             continue
         if path.parent.parent != tables:
-            raise ValueError(f"Unexpected deeper BDNB Parquet path: {relative}")
+            # The original BDNB root also contains manifest.parquet, which
+            # the planner inventories as an unrelated singleton and which
+            # is regenerated during publication. Other dataset metadata
+            # Parquet files must not be interpreted as table fragments.
+            if tables in path.parents:
+                raise ValueError(f"Unexpected deeper BDNB Parquet path: {relative}")
+            continue
         if not PART.fullmatch(path.name):
             raise ValueError(f"Unexpected BDNB filename in plan: {relative}")
         if relative in indexed:
