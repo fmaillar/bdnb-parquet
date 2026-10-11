@@ -79,6 +79,82 @@ class CompactionRunnerTests(unittest.TestCase):
             len(list(self.source.rglob("*.parquet"))), 4
         )
 
+    def test_row_groups_span_input_batch_and_file_boundaries(self):
+        selected = self.selection()
+        result = execute(
+            selected, self.destination, batch_rows=2, zstd_level=3,
+            row_group_rows=5, max_buffer_mib=1,
+        )
+        output, _ = output_paths(self.destination, selected)
+        metadata = pq.read_metadata(output)
+        sizes = [
+            metadata.row_group(i).num_rows
+            for i in range(metadata.num_row_groups)
+        ]
+        self.assertEqual(sizes, [5, 5, 2])
+        self.assertEqual(result["output_row_groups"], 3)
+        self.assertEqual(result["output_min_row_group_rows"], 2)
+        self.assertEqual(result["output_max_row_group_rows"], 5)
+        self.assertEqual(result["verified_rows"], 12)
+
+    def test_realistic_hundred_thousand_row_groups(self):
+        root = self.root / "large-input"
+        root.mkdir()
+        for i in range(2):
+            table = pa.table({
+                "id": pa.array(
+                    range(i * 100_000, (i + 1) * 100_000),
+                    type=pa.int32(),
+                )
+            })
+            pq.write_table(
+                table, root / f"part-{i:05d}.parquet",
+                compression="zstd", row_group_size=100_000,
+            )
+        plan_dir = self.root / "large-plan"
+        candidate_batches = plan(scan(root), 256 * MIB)
+        write_report(root, plan_dir, 256 * MIB, candidate_batches)
+        chosen = read_selection(
+            plan_dir, root, candidate_batches[0].batch_id, None
+        )
+        result = execute(
+            chosen, self.root / "large-output",
+            batch_rows=16_384, zstd_level=3,
+            row_group_rows=100_000, max_buffer_mib=16,
+        )
+        output, _ = output_paths(self.root / "large-output", chosen)
+        metadata = pq.read_metadata(output)
+        sizes = [
+            metadata.row_group(i).num_rows
+            for i in range(metadata.num_row_groups)
+        ]
+        self.assertEqual(sizes, [100_000, 100_000])
+        self.assertEqual(result["verified_rows"], 200_000)
+
+    def test_byte_buffer_budget_can_force_early_flush(self):
+        root = self.root / "wide-input"
+        root.mkdir()
+        for i in range(2):
+            pq.write_table(
+                pa.table({"text": [str(i) + "x" * 600_000] * 3}),
+                root / f"part-{i:05d}.parquet",
+            )
+        plan_dir = self.root / "wide-plan"
+        candidate_batches = plan(scan(root), MIB)
+        write_report(root, plan_dir, MIB, candidate_batches)
+        chosen = read_selection(
+            plan_dir, root, candidate_batches[0].batch_id, None
+        )
+        result = execute(
+            chosen, self.root / "wide-output",
+            batch_rows=3, zstd_level=3,
+            row_group_rows=100, max_buffer_mib=1,
+        )
+        self.assertEqual(result["verified_rows"], 6)
+        # A large Arrow record batch must be sliced rather than
+        # allowing the pending buffer to exceed its configured budget.
+        self.assertGreater(result["output_row_groups"], 1)
+
     def test_pilot_only_first_two_files_and_resume(self):
         selected = self.selection(max_files=2)
         result = execute(selected, self.destination, batch_rows=1, zstd_level=3)
