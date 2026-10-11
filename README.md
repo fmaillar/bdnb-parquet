@@ -315,3 +315,55 @@ For the **full 263-file** BDNB batch, omit `--max-files 10` and choose a fresh
 output directory, for example `/mnt/data/parquet-compaction-full-test-threads4`.
 On an HDD, start with `--threads 4`; benchmark against `--threads 1` on
 separate output trees before tuning or launching corpus-wide work.
+
+## BDNB multi-batch compaction scheduler (experimental)
+
+The `bdnb-parquet-compact-schedule` entry point chooses only compatible
+`review-required` plan batches in explicitly selected BDNB table directories.
+**Dry-run is the default; no Parquet output is created without `--execute`.**
+The planner/runner PRs must be installed before using this command.
+
+Set your specific BDNB table root (path relative to `--source-root`):
+
+```bash
+BDNB_TABLES='territoire-geospatial/cadastre/batiments/base-donnees-nationale/bdnb_2026_02_a_open_data/tables'
+```
+
+Preview one batch, changing no files:
+
+```bash
+bdnb-parquet-compact-schedule \
+  --plan-dir /mnt/data/parquet-compaction-plan \
+  --source-root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet \
+  --output-root /mnt/data/parquet-compaction-scheduled \
+  --tables-root "$BDNB_TABLES" \
+  --table batiment_groupe_hthd \
+  --max-batches 1
+```
+
+After reviewing the selected batch IDs, add `--execute` to run the single
+approved batch. The defaults are `--workers 1`, `--threads 4`,
+`--max-batches 1`, and `--min-free-gib 20`. The scheduler refuses batches
+with filename patterns other than consecutive `part-NNNNN.parquet` pieces;
+it never combines different table directories or exact Arrow schemas.
+
+To test **two independent table batches concurrently**, explicitly select
+two different table names and run with `--workers 2 --max-batches 2 --execute`.
+Process isolation avoids contention over the process-wide Arrow CPU pool.
+The limit of two workers is intentional for HDD-based execution.
+
+A durable JSONL event log is written under
+`<output-root>/_meta/compaction-journal.jsonl`. The latest run summary is
+`<output-root>/_meta/last-run.json`. A stopped run is restarted using the
+same command: each existing output is fully reverified rather than blindly
+trusted or overwritten. The runner retains a per-output JSON provenance
+report and never deletes or rewrites the source files.
+
+Disk-space checks reserve the configured free-space floor plus approximate
+space for simultaneous staged outputs. These checks are *heuristics*, not
+disk quotas; monitor actual free space and RAM during experiments.
+
+**Do not enable `--all-tables` for the complete dataset before semantic
+review of its table inventory.** The scheduler does not resolve source-level
+provenance encoded only in filenames, does not update `_SUCCESS.json` or
+release manifests, and does not publish or remove any original files.
