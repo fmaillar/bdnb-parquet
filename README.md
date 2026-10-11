@@ -263,6 +263,7 @@ bdnb-parquet-compact-run \
   --batch-rows 16384 \
   --row-group-rows 100000 \
   --max-buffer-mib 128 \
+  --threads 4 \
   --zstd-level 3
 ```
 
@@ -278,16 +279,27 @@ is additionally limited to approximately `--max-buffer-mib 128` MiB: when the
 limit is reached, a shorter row group is written. Actual process memory also
 includes active input batches, writer compression buffers, and Arrow overhead.
 The default compression is ZSTD level 3.
+
+`--threads 4` enables PyArrow's multithreaded **column decoding** during
+both conversion and value verification, using a temporary four-thread Arrow
+CPU pool. One batch still writes a single Parquet output sequentially. This
+can improve CPU-limited wide tables, but may not accelerate a mechanical-HDD
+I/O bottleneck; do not assume linear speedups. Compare timings on the m710s.
 Before promoting the temporary output, the runner reopens it, checks its
 schema and row count, and compares **every logical Arrow value in order**
 against all selected source files. Only a verified output is atomically
-renamed into place, followed by a JSON audit report alongside it.
+renamed into place, followed by a JSON audit report alongside it. A new
+output undergoes exactly **one full-value verification** on its staging file:
+the atomic rename does not modify its contents. Existing outputs are always
+reverified completely on restart or with `--verify-only`.
 
 On restart, if the output already exists, it is reverified instead of being
 rewritten. **For row-group or compression benchmarks, use a fresh output root**
 (e.g. `/mnt/data/parquet-compaction-pilot-v2`), since rerunning with different
 flags does not overwrite an existing validated output. The JSON report includes
-output row-group counts and minimum/maximum group sizes.
+output row-group counts and minimum/maximum group sizes, plus the requested
+thread count, write/verify/total wall times and logical-source-byte MiB/s
+for the write and verify phases (not physical disk bandwidth).
 Use `--verify-only` to check an existing output without creating one.
 A malformed plan, changed source, or mismatching data stops the run.
 
@@ -298,3 +310,8 @@ merged Parquet data, although all input paths are retained in the sidecar
 JSON report. It does not update BDNB `_SUCCESS.json` or release manifests,
 and it never removes original Parquet files. No automatic corpus-wide
 compaction or publication is performed.
+
+For the **full 263-file** BDNB batch, omit `--max-files 10` and choose a fresh
+output directory, for example `/mnt/data/parquet-compaction-full-test-threads4`.
+On an HDD, start with `--threads 4`; benchmark against `--threads 1` on
+separate output trees before tuning or launching corpus-wide work.
