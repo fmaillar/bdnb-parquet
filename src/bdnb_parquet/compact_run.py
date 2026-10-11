@@ -187,14 +187,22 @@ def arrow_cpu_threads(threads: int) -> Iterator[None]:
 
 
 def batches(
-    paths: tuple[Path, ...], batch_rows: int, threads: int = 1
+    paths: tuple[Path, ...], batch_rows: int, threads: int = 1,
+    progress: bool = False,
 ) -> Iterator[pa.RecordBatch]:
-    for path in paths:
+    for index, path in enumerate(paths, start=1):
         parquet = pq.ParquetFile(path)
         try:
-            yield from parquet.iter_batches(batch_size=batch_rows, use_threads=threads > 1)
+            yield from parquet.iter_batches(
+                batch_size=batch_rows, use_threads=threads > 1
+            )
         finally:
             parquet.close()
+        if progress and (index % 10 == 0 or index == len(paths)):
+            print(
+                f"VERIFY [{index}/{len(paths)}] source files compared",
+                file=sys.stderr, flush=True,
+            )
 
 
 def compare_rows(
@@ -202,7 +210,7 @@ def compare_rows(
     threads: int = 1,
 ) -> int:
     """Compare all logical Arrow values in order, regardless of batch boundaries."""
-    left = iter(batches(original, batch_rows, threads))
+    left = iter(batches(original, batch_rows, threads, progress=True))
     right = iter(batches((output,), batch_rows, threads))
     first = next(left, None)
     second = next(right, None)
