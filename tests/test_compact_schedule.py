@@ -90,7 +90,7 @@ class SchedulerTests(unittest.TestCase):
         )
 
     def test_rejects_wrong_tables_root_and_unknown_table(self):
-        with self.assertRaisesRegex(ValueError, "must end with"):
+        with self.assertRaisesRegex(ValueError, "ending in"):
             load_candidates(
                 self.plan_dir, self.source.resolve(),
                 "territoire/bdnb",
@@ -166,7 +166,8 @@ class SchedulerTests(unittest.TestCase):
             "--source-root", str(self.source),
             "--output-root", str(self.output),
             "--tables-root", self.tables_root,
-            "--all-tables",
+            "--table", "batiment_groupe_hthd",
+            "--table", "batiment_groupe_risques",
             "--max-batches", "2",
             "--workers", "2",
             "--threads", "2",
@@ -182,6 +183,50 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(summary["verified_rows"], 120)
         self.assertEqual(summary["files_reduced"], 4)
         self.assertEqual(len(list(self.output.rglob("compact-*.parquet"))), 2)
+
+    def test_four_processes_compact_four_separate_tables(self):
+        import shutil
+        for name in ("batiment_groupe_local", "batiment_groupe_adresse"):
+            directory = self.source / self.tables_root / name
+            directory.mkdir(parents=True)
+            for index in range(3):
+                pq.write_table(
+                    pa.table({
+                        "id": pa.array([index * 10 + k for k in range(20)]),
+                        "label": pa.array([name] * 20),
+                    }),
+                    directory / f"part-{index:05d}.parquet",
+                    row_group_size=10,
+                )
+        shutil.rmtree(self.plan_dir)
+        write_report(
+            self.source, self.plan_dir, MIB,
+            plan(scan(self.source), MIB),
+        )
+        args = [
+            "--plan-dir", str(self.plan_dir),
+            "--source-root", str(self.source),
+            "--output-root", str(self.output),
+            "--tables-root", self.tables_root,
+            "--table", "batiment_groupe_hthd",
+            "--table", "batiment_groupe_risques",
+            "--table", "batiment_groupe_local",
+            "--table", "batiment_groupe_adresse",
+            "--max-batches", "4",
+            "--workers", "4",
+            "--threads", "2",
+            "--min-free-gib", "0",
+            "--execute",
+        ]
+        self.assertEqual(main(args), 0)
+        summary = json.loads(
+            (self.output / "_meta" / "last-run.json").read_text()
+        )
+        self.assertEqual(summary["successful_batches"], 4)
+        self.assertEqual(summary["failed_batches"], 0)
+        self.assertEqual(summary["verified_rows"], 240)
+        self.assertEqual(summary["files_reduced"], 8)
+        self.assertEqual(len(list(self.output.rglob("compact-*.parquet"))), 4)
 
     def test_cli_no_execute_does_not_create_journal(self):
         self.assertEqual(main(self.args()), 0)
