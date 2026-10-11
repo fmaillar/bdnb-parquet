@@ -391,3 +391,50 @@ compressed input batches); this is a heuristic, not a hard quota.
 Source-level semantic/provenance review remains required before publishing
 any derivative corpus. `_SUCCESS.json`, release manifests and torrents
 are not modified.
+
+## Publish a fully verified compacted BDNB in place
+
+`bdnb-parquet-compact-publish` is the **destructive finalization command**
+for the BDNB subtree of the larger French open-data snapshot. Do not run it
+before `bdnb-parquet-compact-schedule` has successfully compacted **all**
+eligible BDNB batches. It fails closed when any compacted batch is missing.
+
+On the m710s, use the existing plan, corpus and compacted output:
+
+```bash
+BDNB_TABLES='territoire-geospatial/cadastre/batiments/base-donnees-nationale/bdnb_2026_02_a_open_data/tables'
+
+bdnb-parquet-compact-publish \
+  --plan-dir /mnt/data/parquet-compaction-plan \
+  --source-root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet \
+  --output-root /mnt/data/parquet-compaction-scheduled \
+  --tables-root "$BDNB_TABLES" \
+  --execute \
+  --prune-backup
+```
+
+### Publication contract
+
+- Requires the original BDNB `_SUCCESS.json` markers to match every
+  table's planned source parts and total rows, with zero gaps in numbering.
+- Requires all candidate compaction outputs and provenance JSON reports.
+  Rechecks **all logical Arrow values** against the sources before staging.
+- Builds a complete sibling BDNB dataset tree by **hardlinking** existing
+  compacted outputs and singleton/non-compacted source parts; no bulk 32 GiB
+  duplicate copy. Source and compacted outputs must be on one filesystem.
+- Renumbers the new Parquet parts `part-00000.parquet`, etc.; updates
+  `_SUCCESS.json`, `schemas/*.json`, `manifest.json`, `manifest.parquet`,
+  and records compaction provenance in `dataset.json` and `_COMPACTION.json`.
+- Validates all final part row counts and rebuilt manifest; then renames
+  the original BDNB dataset to `*.precompact-backup` and activates the
+  replacement. Without `--prune-backup`, the old dataset is retained.
+- With `--prune-backup`, **permanently deletes obsolete originals** only
+  after validating the activated replacement. Non-compactable singleton
+  Parquet data is preserved via hardlinks, not deleted.
+- On interruption during directory rename, the backup is preserved and
+  subsequent runs refuse to proceed until it has been inspected/recovered.
+
+**Scope:** Only this BDNB dataset subtree is replaced. The remaining
+datasets in the 322-GiB corpus are untouched. Existing snapshot-level
+manifest/checksum/torrent metadata outside BDNB may now be stale and must
+be rebuilt **before** creating or seeding the replacement torrent.
