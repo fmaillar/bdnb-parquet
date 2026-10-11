@@ -361,7 +361,7 @@ bdnb-parquet-compact-schedule \
   --approved-tables /tmp/bdnb-table-review.tsv \
   --max-batches 4 \
   --workers 4 \
-  --threads 4
+  --threads 2
 ```
 
 This only displays candidate batch IDs and paths. Add `--execute` only
@@ -369,7 +369,7 @@ after reviewing the selection.
 
 Defaults: `--workers 1`, `--threads 4`, `--max-batches 1`,
 `--min-free-gib 20`. Workers 2, 3 and 4 use separate processes and Arrow
-CPU thread pools. Four processes × four threads requires HDD/CPU/RAM
+CPU thread pools. Four processes × two threads requires HDD/CPU/RAM
 monitoring and is not guaranteed faster than two processes.
 
 Repeatable `--table NAME` is also an explicit selector. `--all-tables` is
