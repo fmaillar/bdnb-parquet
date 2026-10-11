@@ -21,6 +21,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 DEFAULT_BATCH_ROWS = 16384
+DEFAULT_ROW_GROUP_ROWS = 100000
+DEFAULT_MAX_BUFFER_MIB = 128
+MIB = 1024**2
 BATCH_ID_PATTERN = re.compile(r"[0-9a-f]{64}-[0-9]{4}\Z")
 
 
@@ -218,21 +221,77 @@ def verify(selection: Selection, output: Path, batch_rows: int) -> int:
     return verified
 
 
-def write_stream(selection: Selection, output: Path, schema: pa.Schema,
-                 batch_rows: int, zstd_level: int) -> int:
+def write_stream(
+    selection: Selection,
+    output: Path,
+    schema: pa.Schema,
+    batch_rows: int,
+    zstd_level: int,
+    row_group_rows: int,
+    max_buffer_mib: int,
+) -> int:
+    """Buffer small read batches into larger Parquet row groups.
+
+    The buffer is limited by both row count and approximate uncompressed
+    Arrow bytes. A batch can be sliced when necessary to respect the cap.
+    This bounds the *pending* buffer, not PyArrow's total process memory.
+    """
+    if row_group_rows <= 0 or max_buffer_mib <= 0:
+        raise ValueError("Row group size and buffer budget must be positive")
+    budget_bytes = max_buffer_mib * MIB
     total = 0
+    pending: list[pa.RecordBatch] = []
+    pending_rows = 0
+    pending_bytes = 0
+
     with pq.ParquetWriter(
         output, schema=schema, compression="zstd",
         compression_level=zstd_level,
     ) as writer:
+        def flush() -> None:
+            nonlocal pending, pending_rows, pending_bytes
+            if not pending:
+                return
+            table = pa.Table.from_batches(pending, schema=schema)
+            # Exactly one row group per flush, independent of input batches.
+            writer.write_table(table, row_group_size=table.num_rows)
+            pending = []
+            pending_rows = 0
+            pending_bytes = 0
+
         for index, item in enumerate(selection.sources, start=1):
             parquet = pq.ParquetFile(item.path)
             try:
                 for batch in parquet.iter_batches(
                     batch_size=batch_rows, use_threads=False
                 ):
-                    writer.write_batch(batch)
                     total += batch.num_rows
+                    offset = 0
+                    while offset < batch.num_rows:
+                        take = min(
+                            row_group_rows - pending_rows,
+                            batch.num_rows - offset,
+                        )
+                        piece = batch.slice(offset, take)
+                        if pending and pending_bytes + piece.nbytes > budget_bytes:
+                            flush()
+                            continue
+                        # A single input slice may itself exceed the budget.
+                        # Halve it until it fits, or report that even a single
+                        # very large row cannot be buffered within the cap.
+                        while piece.nbytes > budget_bytes and take > 1:
+                            take = max(1, take // 2)
+                            piece = batch.slice(offset, take)
+                        if piece.nbytes > budget_bytes:
+                            raise ValueError(
+                                "A single Arrow row exceeds --max-buffer-mib"
+                            )
+                        pending.append(piece)
+                        pending_rows += piece.num_rows
+                        pending_bytes += piece.nbytes
+                        offset += take
+                        if pending_rows == row_group_rows:
+                            flush()
             finally:
                 parquet.close()
             print(
@@ -241,6 +300,8 @@ def write_stream(selection: Selection, output: Path, schema: pa.Schema,
                 file=sys.stderr,
                 flush=True,
             )
+        flush()
+
     if total != sum(item.rows for item in selection.sources):
         raise ValueError("Input row count changed during writing")
     return total
@@ -272,7 +333,11 @@ def atomic_report(path: Path, content: dict[str, object]) -> None:
 def execute(
     selection: Selection, output_root: Path, batch_rows: int,
     zstd_level: int, verify_only: bool = False,
+    row_group_rows: int = DEFAULT_ROW_GROUP_ROWS,
+    max_buffer_mib: int = DEFAULT_MAX_BUFFER_MIB,
 ) -> dict[str, object]:
+    if row_group_rows <= 0 or max_buffer_mib <= 0:
+        raise ValueError("Row group size and buffer budget must be positive")
     schema = inspect_sources(selection)
     target, report = output_paths(output_root, selection)
     if not target.exists() and verify_only:
@@ -296,7 +361,10 @@ def execute(
         if stage.is_symlink():
             raise ValueError("Staging file must not be a symbolic link")
         try:
-            write_stream(selection, stage, schema, batch_rows, zstd_level)
+            write_stream(
+                selection, stage, schema, batch_rows, zstd_level,
+                row_group_rows, max_buffer_mib,
+            )
             print("VERIFY: comparing all source values with staged output", file=sys.stderr, flush=True)
             verified = verify(selection, stage, batch_rows)
             os.replace(stage, target)
@@ -306,6 +374,11 @@ def execute(
     # Always verify even when resuming an existing output.
     print("VERIFY: checking published output", file=sys.stderr, flush=True)
     verified = verify(selection, target, batch_rows)
+    output_metadata = pq.read_metadata(target)
+    group_lengths = [
+        output_metadata.row_group(i).num_rows
+        for i in range(output_metadata.num_row_groups)
+    ]
     result: dict[str, object] = {
         "batch_id": selection.batch_id,
         "pilot": selection.pilot,
@@ -316,6 +389,9 @@ def execute(
         "verified_rows": verified,
         "source_bytes": sum(item.bytes for item in selection.sources),
         "output_bytes": target.stat().st_size,
+        "output_row_groups": len(group_lengths),
+        "output_min_row_group_rows": min(group_lengths, default=0),
+        "output_max_row_group_rows": max(group_lengths, default=0),
         "output": str(target),
         "codec": "zstd",
         "validation": "full-ordered-Arrow-record-batch-equality",
@@ -333,13 +409,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--batch-id", required=True)
     parser.add_argument("--max-files", type=int, help="pilot: only first N files")
-    parser.add_argument("--batch-rows", type=int, default=DEFAULT_BATCH_ROWS)
+    parser.add_argument(
+        "--batch-rows", type=int, default=DEFAULT_BATCH_ROWS,
+        help="source read and verification batch size (default: 16384 rows)",
+    )
+    parser.add_argument(
+        "--row-group-rows", type=int, default=DEFAULT_ROW_GROUP_ROWS,
+        help="target output Parquet row group size (default: 100000 rows)",
+    )
+    parser.add_argument(
+        "--max-buffer-mib", type=int, default=DEFAULT_MAX_BUFFER_MIB,
+        help="approximate limit on pending uncompressed Arrow bytes (default: 128 MiB)",
+    )
     parser.add_argument("--zstd-level", type=int, default=3)
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args(argv)
 
     if args.batch_rows <= 0:
         parser.error("--batch-rows must be positive")
+    if args.row_group_rows <= 0:
+        parser.error("--row-group-rows must be positive")
+    if args.max_buffer_mib <= 0:
+        parser.error("--max-buffer-mib must be positive")
     if not 1 <= args.zstd_level <= 19:
         parser.error("--zstd-level must be in [1, 19]")
     source = args.source_root.expanduser().resolve()
@@ -352,6 +443,8 @@ def main(argv: list[str] | None = None) -> int:
         result = execute(
             selection, output, args.batch_rows, args.zstd_level,
             verify_only=args.verify_only,
+            row_group_rows=args.row_group_rows,
+            max_buffer_mib=args.max_buffer_mib,
         )
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
