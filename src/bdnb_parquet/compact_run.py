@@ -59,6 +59,13 @@ def relative_path(raw: str) -> Path:
     return Path(*posix.parts)
 
 
+def relative_directory_path(raw: str) -> Path:
+    """A dataset directory may legitimately be the corpus root ('.')."""
+    if raw == ".":
+        return Path(".")
+    return relative_path(raw)
+
+
 def reject_overlapping_trees(source: Path, output: Path) -> None:
     if source == output or source in output.parents or output in source.parents:
         raise ValueError("Source and output trees must not overlap")
@@ -85,7 +92,7 @@ def read_selection(
         raise ValueError("Batch must exist uniquely with review-required status")
     row = selected[0]
     directory = row["directory"]
-    relative_path(directory)
+    relative_directory_path(directory)
     schema_hash = row["schema_hash"]
 
     with (plan_dir / "files.tsv").open(newline="", encoding="utf-8") as fh:
@@ -312,7 +319,7 @@ def output_paths(output_root: Path, selection: Selection) -> tuple[Path, Path]:
         f"-pilot-{len(selection.sources)}" if selection.pilot else ""
     )
     name = f"compact-{selection.batch_id}{suffix}.parquet"
-    target = output_root / relative_path(selection.directory) / name
+    target = output_root / relative_directory_path(selection.directory) / name
     if not target.resolve().is_relative_to(output_root):
         raise ValueError("Output directory escapes output root")
     return target, target.with_suffix(".json")
