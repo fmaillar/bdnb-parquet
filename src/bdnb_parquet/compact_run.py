@@ -225,7 +225,7 @@ def write_stream(selection: Selection, output: Path, schema: pa.Schema,
         output, schema=schema, compression="zstd",
         compression_level=zstd_level,
     ) as writer:
-        for item in selection.sources:
+        for index, item in enumerate(selection.sources, start=1):
             parquet = pq.ParquetFile(item.path)
             try:
                 for batch in parquet.iter_batches(
@@ -235,6 +235,12 @@ def write_stream(selection: Selection, output: Path, schema: pa.Schema,
                     total += batch.num_rows
             finally:
                 parquet.close()
+            print(
+                f"WRITE [{index}/{len(selection.sources)}] "
+                f"{total:,} rows, {item.relative}",
+                file=sys.stderr,
+                flush=True,
+            )
     if total != sum(item.rows for item in selection.sources):
         raise ValueError("Input row count changed during writing")
     return total
@@ -291,12 +297,14 @@ def execute(
             raise ValueError("Staging file must not be a symbolic link")
         try:
             write_stream(selection, stage, schema, batch_rows, zstd_level)
+            print("VERIFY: comparing all source values with staged output", file=sys.stderr, flush=True)
             verified = verify(selection, stage, batch_rows)
             os.replace(stage, target)
         finally:
             stage.unlink(missing_ok=True)
 
     # Always verify even when resuming an existing output.
+    print("VERIFY: checking published output", file=sys.stderr, flush=True)
     verified = verify(selection, target, batch_rows)
     result: dict[str, object] = {
         "batch_id": selection.batch_id,
