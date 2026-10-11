@@ -40,6 +40,7 @@ bdnb-normalize-layout = "bdnb_parquet.normalize_layout:main"
 bdnb-build-snapshot-index = "bdnb_parquet.snapshot_index:main"
 bdnb-normalize-rna = "bdnb_parquet.normalize_rna:main"
 bdnb-normalize-vigieau = "bdnb_parquet.normalize_vigieau:main"
+bdnb-parquet-compact = "bdnb_parquet.compact_parquet:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
