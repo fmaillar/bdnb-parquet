@@ -200,3 +200,47 @@ numpy/                          ->  legacy layer to retire after validation
 ```
 
 The audit never modifies or deletes dataset content.
+
+## Parquet compaction planning (read-only)
+
+The `bdnb-parquet-compact` command inventories Parquet footers and proposes
+physical file-compaction candidates. **This first phase does not rewrite,
+move, or delete any source file.** It can be run against a BDNB dataset or a
+larger Parquet corpus.
+
+Run on the m710s (Python 3.13, with the project installed):
+
+```bash
+bdnb-parquet-compact \
+  --root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet \
+  --output-dir /tmp/parquet-compaction-plan \
+  --target-mib 256
+```
+
+The output directory must be outside the scanned source tree and must be
+empty or not yet exist. Three files are produced:
+
+- `summary.json`: source counts, rows, logical bytes, estimated output file
+  count and potential file reduction;
+- `batches.tsv`: one row per proposed output batch, with status, schema
+  fingerprint, and input row count;
+- `files.tsv`: one row per source file, mapping each input to a batch.
+
+The grouping criterion is **same parent directory and identical serialized
+Arrow schema**, including schema/field metadata such as GeoParquet attributes.
+Source filenames are sorted deterministically. Original compressed sizes are
+used as a heuristic to pack batches towards the requested target size;
+the real size after recompression cannot be predicted from this plan.
+
+Only groups with more than one file receive `review-required` status.
+`keep` marks single files, `keep-oversize` marks files already above the
+target, and `skip-partial` prevents interrupted outputs from entering
+candidates. **Even a review-required candidate is not automatically safe to
+merge:** schema equality does not establish dataset, temporal, geographic
+partition, ordering or source-provenance equivalence. Review the TSV
+manifests and accompanying dataset-specific metadata before authorizing an
+actual compaction.
+
+This phase does not estimate storage savings and does not validate row values.
+The next phase will implement streamed writing and integrity verification
+in a separate output tree after an explicit plan has been approved.
