@@ -261,6 +261,8 @@ bdnb-parquet-compact-run \
   --batch-id d1d1ac9f87edca61f1e292eff7d247413af32fb09e5f8b43b89ab5c443f50af7-0001 \
   --max-files 10 \
   --batch-rows 16384 \
+  --row-group-rows 100000 \
+  --max-buffer-mib 128 \
   --zstd-level 3
 ```
 
@@ -269,16 +271,25 @@ so it cannot be confused with the full 263-part batch. Without
 `--max-files`, all source files listed for that batch are processed.
 
 Before writing, each source's size, footer row count, and serialized Arrow
-schema are compared with the saved plan. Parquet is read and written using
-bounded RecordBatches, with ZSTD compression (level 3 by default).
+schema are compared with the saved plan. Parquet is read in small RecordBatches
+(`--batch-rows 16384`), but several batches are buffered to form larger output
+row groups (`--row-group-rows 100000`). The pending uncompressed Arrow buffer
+is additionally limited to approximately `--max-buffer-mib 128` MiB: when the
+limit is reached, a shorter row group is written. Actual process memory also
+includes active input batches, writer compression buffers, and Arrow overhead.
+The default compression is ZSTD level 3.
 Before promoting the temporary output, the runner reopens it, checks its
 schema and row count, and compares **every logical Arrow value in order**
 against all selected source files. Only a verified output is atomically
 renamed into place, followed by a JSON audit report alongside it.
 
 On restart, if the output already exists, it is reverified instead of being
-rewritten. Use `--verify-only` to check an existing output without creating
-one. A malformed plan, changed source, or mismatching data stops the run.
+rewritten. **For row-group or compression benchmarks, use a fresh output root**
+(e.g. `/mnt/data/parquet-compaction-pilot-v2`), since rerunning with different
+flags does not overwrite an existing validated output. The JSON report includes
+output row-group counts and minimum/maximum group sizes.
+Use `--verify-only` to check an existing output without creating one.
+A malformed plan, changed source, or mismatching data stops the run.
 
 Limitations: this experimental command processes a **single manually reviewed
 batch**. It cannot establish dataset semantic equivalence from schemas alone;
