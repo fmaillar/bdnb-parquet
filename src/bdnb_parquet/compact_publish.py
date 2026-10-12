@@ -175,6 +175,7 @@ def selections_for_dataset(
 def stage_dataset(
     *,
     source_root: Path,
+    publish_root: Path,
     plan_dir: Path,
     compact_root: Path,
     tables_relative: str,
@@ -182,13 +183,20 @@ def stage_dataset(
     reverify: bool = True,
 ) -> dict[str, Any]:
     base = checked_tables_root(tables_relative)
-    tables = source_root / base
+    source_tables = source_root / base
+    source_dataset = source_tables.parent
+    tables = publish_root / base
     dataset = tables.parent
-    if dataset.is_symlink() or tables.is_symlink():
+    if any(p.is_symlink() for p in (
+        source_dataset, source_tables, dataset, tables,
+    )):
         raise ValueError("Refusing BDNB symlink directory")
 
+    # Read the immutable plan using its original source-root path. Construct
+    # the staged replacement via the physical writable mount, not the
+    # separate bind-mount view (Linux returns EXDEV between mount IDs).
     indexed, input_totals = inspect_plan(
-        plan_dir, source_root, dataset, tables
+        plan_dir, source_root, source_dataset, source_tables
     )
     selections = selections_for_dataset(plan_dir, source_root, indexed)
     checked: dict[str, Path] = {}
@@ -256,7 +264,7 @@ def stage_dataset(
         seen: set[str] = set()
         new_sources: list[Path] = []
         for original in parts:
-            relative = original.relative_to(source_root).as_posix()
+            relative = original.relative_to(publish_root).as_posix()
             row = indexed[relative]
             batch_id = row["batch_id"]
             if row["status"] == "review-required":
@@ -392,6 +400,38 @@ def require_writable_publication_parent(dataset: Path) -> None:
     probe.rmdir()
 
 
+def require_hardlink_compatible(compact_root: Path, dataset: Path) -> None:
+    """Check actual cross-mount hardlinking before expensive batch verification.
+
+    Linux refuses hardlinks across distinct VFS mount IDs, even when both
+    paths refer to the same ext4 device. This explicitly tests the relevant
+    operation using tiny temporary files, without touching the Parquet data.
+    """
+    if not compact_root.is_dir():
+        raise FileNotFoundError(
+            f"Compacted output directory is missing: {compact_root}"
+        )
+    with tempfile.TemporaryDirectory(
+        prefix=".bdnb-link-preflight-", dir=dataset.parent,
+    ) as target_dir:
+        with tempfile.NamedTemporaryFile(
+            prefix=".bdnb-link-preflight-", dir=compact_root,
+        ) as source:
+            linked = Path(target_dir) / "link"
+            try:
+                os.link(source.name, linked)
+            except OSError as exc:
+                if exc.errno == errno.EXDEV:
+                    raise OSError(
+                        errno.EXDEV,
+                        "Compaction outputs and publication target use different "
+                        "mount IDs; use --writable-source-root pointing to the "
+                        "native /mnt/data/datasets/.../parquet path",
+                        str(dataset),
+                    ) from exc
+                raise
+
+
 def prune_validated_backup(backup: Path) -> None:
     """Remove an obsolete read-only BDNB backup, never touching its file modes.
 
@@ -417,14 +457,31 @@ def prune_validated_backup(backup: Path) -> None:
 def publish(
     source_root: Path, plan_dir: Path, compact_root: Path,
     tables_relative: str, *, prune_backup: bool,
+    writable_source_root: Path | None = None,
 ) -> dict[str, Any]:
     root = source_root.resolve()
+    publish_root = (
+        writable_source_root.resolve()
+        if writable_source_root is not None
+        else root
+    )
     plan_dir = plan_dir.resolve()
     compact_root = compact_root.resolve()
     reject_overlapping_trees(root, compact_root)
     reject_overlapping_trees(root, plan_dir)
+    reject_overlapping_trees(publish_root, compact_root)
+    reject_overlapping_trees(publish_root, plan_dir)
+    if not root.samefile(publish_root):
+        raise ValueError(
+            "--writable-source-root must be the exact same source directory "
+            "as --source-root, accessed through a different mount"
+        )
     base = checked_tables_root(tables_relative)
-    dataset = root / base.parent
+    dataset = publish_root / base.parent
+    if not (root / base.parent).samefile(dataset):
+        raise ValueError(
+            "The original BDNB dataset differs across the two source roots"
+        )
     stage = dataset.with_name(dataset.name + ".compaction-stage")
     backup = dataset.with_name(dataset.name + ".precompact-backup")
     if backup.exists() or backup.is_symlink():
@@ -435,9 +492,10 @@ def publish(
     if stage.is_symlink():
         raise ValueError("Staging path may not be a symbolic link")
     require_writable_publication_parent(dataset)
+    require_hardlink_compatible(compact_root, dataset)
     started = time.perf_counter()
     report = stage_dataset(
-        source_root=root, plan_dir=plan_dir,
+        source_root=root, publish_root=publish_root, plan_dir=plan_dir,
         compact_root=compact_root, tables_relative=tables_relative,
         stage=stage,
     )
@@ -481,6 +539,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--tables-root", required=True)
     parser.add_argument(
+        "--writable-source-root", type=Path,
+        help=(
+            "native same-inode source path through the /mnt/data mount; "
+            "avoids hardlink EXDEV when --source-root is a bind mount"
+        ),
+    )
+    parser.add_argument(
         "--execute", action="store_true",
         help="explicitly opt into replacing BDNB dataset in the original corpus",
     )
@@ -500,6 +565,10 @@ def main(argv: list[str] | None = None) -> int:
             args.output_root.expanduser(),
             args.tables_root,
             prune_backup=args.prune_backup,
+            writable_source_root=(
+                args.writable_source_root.expanduser()
+                if args.writable_source_root is not None else None
+            ),
         )
         return 0
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
