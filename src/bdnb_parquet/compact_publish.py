@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import errno
 import csv
+import hashlib
 import json
 import os
 import re
@@ -40,11 +41,48 @@ MIB = 2**20
 
 
 def link_file(source: Path, destination: Path) -> None:
+    """Link when possible; otherwise copy and verify bytes across mount IDs.
+
+    Linux returns EXDEV across bind mount boundaries even on one device.
+    Every copied file is independently hashed at source and destination.
+    A temporary file and atomic promotion prevent incomplete stage files.
+    """
     if source.is_symlink() or not source.is_file():
         raise ValueError(f"Unsafe input (not a regular file): {source}")
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(f"Refusing existing destination: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    # Same-filesystem links avoid copying tens of GiB or risking partial copies.
-    os.link(source, destination)
+    try:
+        os.link(source, destination)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+
+    # The output root and the publication view have different mount IDs.
+    # For this case only, copy bytes to a temporary file on the target mount.
+    # Compare hashes from independent reads before atomically promoting it.
+    handle, tmp_name = tempfile.mkstemp(
+        prefix=".bdnb-copy-", suffix=".tmp", dir=destination.parent,
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(handle, "wb") as writer, source.open("rb") as reader:
+            shutil.copyfileobj(reader, writer, length=4 * MIB)
+            writer.flush()
+            os.fsync(writer.fileno())
+        if tmp.stat().st_size != source.stat().st_size:
+            raise IOError(f"Copied size differs from original: {source}")
+        with source.open("rb") as original_stream:
+            original_hash = hashlib.file_digest(original_stream, "sha256").digest()
+        with tmp.open("rb") as copied_stream:
+            copied_hash = hashlib.file_digest(copied_stream, "sha256").digest()
+        if original_hash != copied_hash:
+            raise IOError(f"Copied checksum differs from original: {source}")
+        shutil.copystat(source, tmp)
+        os.replace(tmp, destination)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def copy_tree_hardlinks(source: Path, destination: Path) -> None:
@@ -400,17 +438,21 @@ def require_writable_publication_parent(dataset: Path) -> None:
     probe.rmdir()
 
 
-def require_hardlink_compatible(compact_root: Path, dataset: Path) -> None:
-    """Check actual cross-mount hardlinking before expensive batch verification.
+def require_hardlink_compatible(
+    compact_root: Path, dataset: Path, *, min_free_gib: int = 2,
+) -> bool:
+    """Probe link support before lengthy verification; otherwise budget copies.
 
-    Linux refuses hardlinks across distinct VFS mount IDs, even when both
-    paths refer to the same ext4 device. This explicitly tests the relevant
-    operation using tiny temporary files, without touching the Parquet data.
+    If the source and destination use distinct mount IDs, staging falls back
+    to byte-for-byte verified copies. Reserve enough free space for the
+    compressed outputs plus a configurable free-space floor.
     """
     if not compact_root.is_dir():
         raise FileNotFoundError(
             f"Compacted output directory is missing: {compact_root}"
         )
+    if min_free_gib < 0:
+        raise ValueError("--min-free-gib must be nonnegative")
     with tempfile.TemporaryDirectory(
         prefix=".bdnb-link-preflight-", dir=dataset.parent,
     ) as target_dir:
@@ -421,15 +463,34 @@ def require_hardlink_compatible(compact_root: Path, dataset: Path) -> None:
             try:
                 os.link(source.name, linked)
             except OSError as exc:
-                if exc.errno == errno.EXDEV:
-                    raise OSError(
-                        errno.EXDEV,
-                        "Compaction outputs and publication target use different "
-                        "mount IDs; use --writable-source-root pointing to the "
-                        "native /mnt/data/datasets/.../parquet path",
-                        str(dataset),
-                    ) from exc
-                raise
+                if exc.errno != errno.EXDEV:
+                    raise
+            else:
+                return True
+
+    # Conservatively reserve the total size of all compacted Parquet outputs:
+    # only the links crossing mount boundaries will actually need copies.
+    candidates = list(compact_root.rglob("compact-*.parquet"))
+    if any(p.is_symlink() or not p.is_file() for p in candidates):
+        raise ValueError("Unsafe compacted output in the staging directory")
+    estimated = sum(p.stat().st_size for p in candidates)
+    free = shutil.disk_usage(dataset.parent).free
+    required = estimated + min_free_gib * 2**30
+    if free < required:
+        raise OSError(
+            errno.ENOSPC,
+            f"Cross-mount publication requires up to {estimated / 2**30:.2f} "
+            f"GiB for verified copies and {min_free_gib} GiB reserve; "
+            f"only {free / 2**30:.2f} GiB available",
+            str(dataset.parent),
+        )
+    print(
+        "INFO: hardlinks across mount IDs are unavailable; falling back to "
+        f"SHA-256-verified copies (estimated <= {estimated / 2**30:.2f} GiB)",
+        file=sys.stderr,
+        flush=True,
+    )
+    return False
 
 
 def prune_validated_backup(backup: Path) -> None:
@@ -458,6 +519,7 @@ def publish(
     source_root: Path, plan_dir: Path, compact_root: Path,
     tables_relative: str, *, prune_backup: bool,
     writable_source_root: Path | None = None,
+    min_free_gib: int = 2,
 ) -> dict[str, Any]:
     root = source_root.resolve()
     publish_root = (
@@ -492,7 +554,9 @@ def publish(
     if stage.is_symlink():
         raise ValueError("Staging path may not be a symbolic link")
     require_writable_publication_parent(dataset)
-    require_hardlink_compatible(compact_root, dataset)
+    require_hardlink_compatible(
+        compact_root, dataset, min_free_gib=min_free_gib,
+    )
     started = time.perf_counter()
     report = stage_dataset(
         source_root=root, publish_root=publish_root, plan_dir=plan_dir,
@@ -538,6 +602,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--tables-root", required=True)
+    parser.add_argument("--min-free-gib", type=int, default=2)
     parser.add_argument(
         "--writable-source-root", type=Path,
         help=(
@@ -569,6 +634,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.writable_source_root.expanduser()
                 if args.writable_source_root is not None else None
             ),
+            min_free_gib=args.min_free_gib,
         )
         return 0
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
