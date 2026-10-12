@@ -96,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
         if not tables.parent.samefile(publish_dataset):
             raise ValueError("BDNB dataset paths do not refer to the same data")
         require_writable_publication_parent(publish_dataset)
+        output_root.mkdir(parents=True, exist_ok=True)
         require_hardlink_compatible(output_root, publish_dataset)
         if not selections:
             raise ValueError("No BDNB compaction batches in source plan")
