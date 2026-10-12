@@ -705,39 +705,9 @@ def _validate_original_metadata(
 ) -> None:
     """Verify legacy manifests cover physical Parquet files before rewriting."""
     if dataset_name == "imope":
-        listing = json.loads((original / "manifest.json").read_text())
-        if not isinstance(listing, list):
-            raise ValueError("IMoPE manifest must contain a department list")
-        declared_paths: list[str] = []
-        for item in listing:
-            dept = item["department"]
-            if not isinstance(dept, str) or not dept or "/" in dept or dept == "..":
-                raise ValueError(f"Invalid IMoPE department: {dept!r}")
-            for entry in item["parquet"]:
-                rel = relative_path(entry["path"])
-                declared_paths.append((Path(dept) / rel).as_posix())
-        expected = set(declared_paths)
-        physical = {
-            p.relative_to(original).as_posix()
-            for p in original.rglob("*.parquet")
-        }
-        duplicates = sorted(
-            name for name, count in Counter(declared_paths).items()
-            if count > 1
-        )
-        missing = sorted(expected - physical)
-        unlisted = sorted(physical - expected)
-        if missing or unlisted or duplicates:
-            raise ValueError(
-                "IMoPE manifest misses or duplicates physical inputs: "
-                f"manifest_entries={len(declared_paths)}, "
-                f"manifest_unique={len(expected)}, "
-                f"physical={len(physical)}, "
-                f"missing_on_disk={len(missing)} {missing[:12]!r}, "
-                f"unlisted_on_disk={len(unlisted)} {unlisted[:12]!r}, "
-                f"duplicate_references={len(duplicates)} {duplicates[:12]!r}; "
-                "no automatic source deletion is permitted"
-            )
+        # Caller runs the SHA-256 dedup catalog audit separately so no
+        # unverified alias is silently accepted.
+        return
     elif dataset_name == "vigieau":
         listing = json.loads((original / "manifest.json").read_text())
         paths = [_vigieau_current_output(original, item["output"])
@@ -814,6 +784,7 @@ def _build_stage(
     publish_root: Path, output_root: Path,
     selected: list[tuple[str, Any, str]], inventory: dict[str, int],
     audit_provenance: dict[str, Any],
+    imope_aliases: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     if stage.exists():
         raise RuntimeError(f"Pre-existing stage needs inspection: {stage}")
@@ -838,11 +809,14 @@ def _build_stage(
             relative = Path(src.relative).relative_to(Path(TARGETS[key])).as_posix()
             mapping[relative] = (new_relative, offset, src.rows)
             offset += src.rows
+    imope_resolved_aliases: list[dict[str, Any]] = []
     if key == "datatourisme":
         _stage_nt_parts(stage, original, mapping)
         _manifest_datatourisme(stage, original, mapping)
     elif key == "imope":
-        _manifest_imope(stage, original)
+        imope_resolved_aliases = _manifest_imope(
+            stage, original, mapping, imope_aliases,
+        )
     elif key == "vigieau":
         _manifest_vigieau(stage, original, mapping)
 
@@ -857,6 +831,7 @@ def _build_stage(
         "planner_sha256": audit_provenance["planner_sha256"],
         "candidate_batches": len(selected),
         "sources": rows,
+        "deduplicated_aliases": imope_resolved_aliases,
     }
     replace_json(stage / "_COMPACTION_SOURCES.json", index)
     totals = _validate_stage(
@@ -864,7 +839,11 @@ def _build_stage(
         inventory["candidate_files"], inventory["candidate_batches"],
         mapping,
     )
-    summary = {"dataset": key, **totals, "verified_batches": len(selected)}
+    summary = {
+        "dataset": key, **totals, "verified_batches": len(selected),
+        "deduplicated_aliases": len(imope_resolved_aliases),
+        "deduplicated_alias_rows": sum(int(x["rows"]) for x in imope_resolved_aliases),
+    }
     replace_json(stage / "_COMPACTION.json", summary)
     _restore_directory_modes(stage, dataset)
     return summary
@@ -896,6 +875,7 @@ def publish(
     *, plan_dir: Path, source_root: Path,
     output_root: Path, writable_source_root: Path | None,
     prune_backup: bool, execute: bool, min_free_gib: int = 20,
+    duplicates_catalog: Path | None = None,
 ) -> dict[str, Any]:
     root = source_root.expanduser().resolve()
     publish_root = (
@@ -937,6 +917,14 @@ def publish(
     paths = {
         key: publish_root / prefix for key, prefix in TARGETS.items()
     }
+    # A plan built against the torrent alias must never be treated as an
+    # independent release. Resolve canonical SHA256 objects in the physical
+    # release root and require exact catalog records for every missing file.
+    imope_aliases = _imope_deduplicated_aliases(
+        paths["imope"], root,
+        duplicates_catalog.expanduser().resolve()
+        if duplicates_catalog is not None else None,
+    )
     for key, directory in paths.items():
         if not directory.is_dir() or directory.is_symlink():
             raise ValueError(f"Missing or unsafe dataset: {directory}")
@@ -959,6 +947,10 @@ def publish(
         "expected_reduction": sum(v["candidate_files"] - v["candidate_batches"]
                                   for v in inventory.values()),
         "mode": "execute" if execute else "dry-run",
+        "imope_deduplicated_aliases_verified": len(imope_aliases),
+        "imope_deduplicated_alias_rows": sum(
+            int(x["original_metadata"]["rows"]) for x in imope_aliases.values()
+        ),
         "originals_untouched": True,
     }
     print(json.dumps(overview, indent=2, ensure_ascii=False), flush=True)
@@ -976,7 +968,7 @@ def publish(
             stage = directory.with_name(directory.name + ".compaction-stage")
             staged[key] = _build_stage(
                 key, directory, stage, root, publish_root, output_root,
-                grouped[key], inventory[key], expected,
+                grouped[key], inventory[key], expected, imope_aliases,
             )
             print(f"STAGED {key}: {staged[key]}", flush=True)
 
@@ -1064,6 +1056,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--source-root", required=True, type=Path)
     p.add_argument("--writable-source-root", type=Path)
     p.add_argument("--output-root", required=True, type=Path)
+    p.add_argument(
+        "--duplicates-catalog", type=Path,
+        help="original SHA-256 release deduplication catalog (mandatory for IMoPE aliases)",
+    )
     p.add_argument("--min-free-gib", type=int, default=20)
     p.add_argument("--execute", action="store_true")
     p.add_argument("--prune-backup", action="store_true")
@@ -1077,6 +1073,7 @@ def main(argv: list[str] | None = None) -> int:
             writable_source_root=args.writable_source_root,
             prune_backup=args.prune_backup, execute=args.execute,
             min_free_gib=args.min_free_gib,
+            duplicates_catalog=args.duplicates_catalog,
         )
         return 0
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
