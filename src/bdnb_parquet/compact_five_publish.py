@@ -28,7 +28,9 @@ from .compact_publish import (
     link_file, copy_tree_hardlinks, require_writable_publication_parent,
     prune_validated_backup,
 )
-from .compact_run import output_paths, reject_overlapping_trees, verify
+from .compact_run import (
+    output_paths, reject_overlapping_trees, relative_path, verify,
+)
 from .convert import atomic_json
 from .datatourisme_convert import nt_snapshot_name
 from .imope_promote import validate_parquet
@@ -232,6 +234,74 @@ def _stage_nt_parts(
         replace_json(stage_dir / "_SUCCESS.json", info)
 
 
+def _datatourisme_csv_inventory(
+    original: Path, manifest: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Reconcile manifest CSV outputs with files, allowing ONLY absent zero-row
+    Parquet entries (with zero row groups) explicitly recorded in metadata.
+
+    The zero-row exception never creates an artificial Parquet file and never
+    waives a missing nonempty file, an unlisted physical file, or a duplicate.
+    """
+    entries = manifest.get("csv")
+    if not isinstance(entries, list):
+        raise ValueError("DataTourisme CSV manifest has no csv list")
+    by_path: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("output"), str):
+            raise ValueError("Invalid DataTourisme CSV manifest entry")
+        rel = relative_path(entry["output"])
+        if len(rel.parts) != 2 or rel.parts[0] != "csv" or rel.suffix != ".parquet":
+            raise ValueError(f"Invalid DataTourisme CSV output path: {rel}")
+        name = rel.as_posix()
+        if name in by_path:
+            raise ValueError(
+                "DataTourisme CSV manifest has duplicate output references"
+            )
+        by_path[name] = entry
+    folder = original / "csv"
+    physical = {
+        item.relative_to(original).as_posix()
+        for item in folder.rglob("*.parquet")
+    } if folder.is_dir() else set()
+    extras = sorted(physical - set(by_path))
+    if extras:
+        raise ValueError(
+            "DataTourisme CSV manifest mismatch: "
+            f"unlisted_on_disk={len(extras)} {extras[:8]!r}"
+        )
+    kept: list[dict[str, Any]] = []
+    omitted: list[dict[str, Any]] = []
+    for name, entry in by_path.items():
+        path = original / name
+        if name in physical:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"Unsafe CSV output: {path}")
+            footer = pq.read_metadata(path)
+            if int(entry["rows"]) != footer.num_rows:
+                raise ValueError(
+                    f"DataTourisme CSV rows differ from manifest: {name}"
+                )
+            kept.append(entry)
+        else:
+            if (type(entry.get("rows")) is not int
+                or type(entry.get("row_groups")) is not int
+                or entry["rows"] != 0 or entry["row_groups"] != 0
+                or path.exists() or path.is_symlink()):
+                raise ValueError(
+                    "DataTourisme CSV manifest mismatch: "
+                    f"missing nonempty or unverified output: {name}, "
+                    f"rows={entry.get('rows')!r}, "
+                    f"row_groups={entry.get('row_groups')!r}"
+                )
+            omitted.append({
+                **entry,
+                "reason": "manifest-only CSV output absent from disk; "
+                          "declared zero rows and zero row groups",
+            })
+    return kept, omitted
+
+
 def _manifest_datatourisme(
     stage: Path, original: Path,
     old_to_stage: dict[str, tuple[str, int, int]],
@@ -254,6 +324,10 @@ def _manifest_datatourisme(
     csv_rows = 0
     unique_csv: set[str] = set()
     csv_bytes = 0
+    present_csv, omitted_csv = _datatourisme_csv_inventory(original, manifest)
+    # Never modify or prune the original JSON: this manifest is written only
+    # into the independent staging tree after all source checks succeed.
+    manifest["csv"] = [dict(item) for item in present_csv]
     for entry in manifest["csv"]:
         previous = entry["output"]
         destination, offset, length = old_to_stage.get(
@@ -277,10 +351,19 @@ def _manifest_datatourisme(
     if int(manifest["rows"]) != ntriples_rows + csv_rows:
         raise ValueError("DataTourisme total rows changed")
     manifest["bytes"] = ntriples_bytes + csv_bytes
+    manifest["csv_files"] = len(manifest["csv"])
     manifest["compaction_source_ranges"] = "_COMPACTION_SOURCES.json"
+    if omitted_csv:
+        manifest["compaction_omitted_empty_csv"] = omitted_csv
     replace_json(stage / "manifest.json", manifest)
     dataset = json.loads((original / "dataset.json").read_text(encoding="utf-8"))
-    dataset.update({"bytes": manifest["bytes"], "rows": manifest["rows"]})
+    dataset.update({
+        "bytes": manifest["bytes"],
+        "rows": manifest["rows"],
+        "csv_files": len(manifest["csv"]),
+    })
+    if omitted_csv:
+        dataset["compaction_omitted_empty_csv"] = omitted_csv
     replace_json(stage / "dataset.json", dataset)
 
 
@@ -416,28 +499,16 @@ def _validate_original_metadata(
             raise ValueError("Vigieau manifest does not match original inputs")
     elif dataset_name == "datatourisme":
         manifest = json.loads((original / "manifest.json").read_text())
-        csv_entries = manifest["csv"]
-        expected_paths = [item["output"] for item in csv_entries]
-        expected_csv = set(expected_paths)
-        physical_csv = {
-            p.relative_to(original).as_posix()
-            for p in (original / "csv").glob("*.parquet")
-        }
-        # A duplicate manifest entry is itself ambiguous: two independent
-        # CSV sources may not silently be assigned the same output.
-        if len(expected_paths) != len(expected_csv):
-            raise ValueError(
-                "DataTourisme CSV manifest has duplicate output references"
-            )
-        if physical_csv != expected_csv:
-            missing = sorted(expected_csv - physical_csv)
-            unlisted = sorted(physical_csv - expected_csv)
-            raise ValueError(
-                "DataTourisme CSV manifest mismatch: "
-                f"listed={len(expected_csv)}, physical={len(physical_csv)}, "
-                f"missing_on_disk={len(missing)} {missing[:8]!r}, "
-                f"unlisted_on_disk={len(unlisted)} {unlisted[:8]!r}; "
-                "publication is blocked until discrepancies are audited"
+        _present, missing_empty = _datatourisme_csv_inventory(
+            original, manifest,
+        )
+        if missing_empty:
+            print(
+                f"INFO: DataTourisme has {len(missing_empty)} absent "
+                "zero-row CSV output(s) listed only in its manifest; "
+                "publication will omit these physical references and "
+                "record every omission in the new manifest",
+                file=sys.stderr, flush=True,
             )
 
 
