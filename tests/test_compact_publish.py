@@ -98,6 +98,25 @@ class PublishCompactionTests(unittest.TestCase):
             "tables_relative": self.tables_root,
         }
 
+    def test_rw_mount_without_parent_write_permission_fails_fast(self):
+        args = [
+            "--plan-dir", str(self.plan_dir),
+            "--source-root", str(self.root),
+            "--output-root", str(self.output_root),
+            "--tables-root", self.tables_root,
+            "--execute", "--prune-originals",
+        ]
+        with patch(
+            "bdnb_parquet.compact_publish.tempfile.mkdtemp",
+            side_effect=PermissionError(13, "Permission denied"),
+        ):
+            self.assertEqual(compact_all_main(args), 1)
+            with self.assertRaises(PermissionError):
+                publish(**self.kwargs(), prune_backup=True)
+        self.assertFalse(self.output_root.exists())
+        self.assertFalse(self.dataset.with_name("bdnb.compaction-stage").exists())
+        self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 4)
+
     def test_read_only_dataset_fails_before_compaction_or_verification(self):
         args = [
             "--plan-dir", str(self.plan_dir),
