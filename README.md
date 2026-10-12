@@ -582,8 +582,20 @@ bdnb-parquet-compact-five-publish \
   --plan-dir /mnt/data/parquet-compaction-plan \
   --source-root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet \
   --writable-source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet \
-  --output-root /mnt/data/parquet-compaction-other5
+  --output-root /mnt/data/parquet-compaction-other5 \
+  --duplicates-catalog /mnt/data/datasets/release-parquet-plan/_meta/duplicates.tsv
 ```
+
+IMoPE has 187 SHA-256 deduplicated logical source paths absent from
+the physical release. Use the original `duplicates.tsv` catalog to prove
+the byte-identical canonical source for **every** missing path. Preflight
+verifies exact duplicate/canonical paths, original byte counts, real
+canonical SHA-256, row count, row groups, columns and GeoParquet status;
+no missing entry may be guessed from filename or schema. If a canonical
+file itself is compacted, aliases resolve to its final physical file and
+exact row range. Published metadata separates physical
+`rows` from `original_logical_rows` and preserves all aliases in
+`deduplicated_aliases` without recreating physical duplicates.
 
 The preflight checks the old plan against the actual dataset file counts,
 inspects converter manifests and rejects missing, changed or unrecognized
@@ -612,6 +624,7 @@ bdnb-parquet-compact-five-publish \
   --source-root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet \
   --writable-source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet \
   --output-root /mnt/data/parquet-compaction-other5 \
+  --duplicates-catalog /mnt/data/datasets/release-parquet-plan/_meta/duplicates.tsv \
   --execute --prune-backup
 ```
 
