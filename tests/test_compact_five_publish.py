@@ -137,7 +137,7 @@ class FiveDatasetPublicationTests(unittest.TestCase):
 
     def test_preview_does_not_modify_sources(self):
         self.assertEqual(self.run_pub(), 0)
-        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 14)
+        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 13)
         self.assertTrue((self.dirs["vigieau"] / "geojson/2025/arretes-2025-12-01.parquet").exists())
         self.assertFalse(self.dirs["vigieau"].with_name("vigieau.compaction-stage").exists())
 
@@ -152,7 +152,7 @@ class FiveDatasetPublicationTests(unittest.TestCase):
         self.assertEqual(report["redundant_source_files"], 6)
         self.assertTrue(report["pruned"])
         self.assertEqual(self.excluded.read_bytes(), before)
-        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 8)
+        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 7)
         self.assertEqual(
             pq.read_metadata(self.dirs["datatourisme"] / "ntriples/snap/part-00000.parquet").num_rows,
             12,
@@ -198,7 +198,7 @@ class FiveDatasetPublicationTests(unittest.TestCase):
         output = next(self.outputs.rglob("compact-*.parquet"))
         output.write_bytes(b"corrupted")
         self.assertEqual(self.run_pub("--execute", "--prune-backup"), 1)
-        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 14)
+        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 13)
         self.assertFalse(any(
             p.name.endswith(".precompact-backup")
             for p in self.root.rglob("*")
@@ -218,7 +218,11 @@ class FiveDatasetPublicationTests(unittest.TestCase):
         with patch("bdnb_parquet.compact_five_publish.os.replace",
                    side_effect=replace_with_failure):
             self.assertEqual(self.run_pub("--execute", "--prune-backup"), 1)
-        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 14)
+        self.assertEqual(
+            sum(len(list(directory.rglob("*.parquet")))
+                for directory in self.dirs.values()) + 1,
+            13,
+        )
         self.assertTrue(
             (self.dirs["waldec"] / "by-source/event-0.parquet").exists()
         )
