@@ -691,6 +691,9 @@ def _vigieau_reconciled_inventory(
     listing = json.loads((original / "manifest.json").read_text(encoding="utf-8"))
     if not isinstance(listing, list):
         raise ValueError("Unexpected Vigieau manifest layout")
+    metadata = json.loads((original / "dataset.json").read_text(encoding="utf-8"))
+    if int(metadata["parquet_files"]) != len(listing):
+        raise ValueError("Vigieau source manifest file count changed")
     entries: dict[str, dict[str, Any]] = {}
     for item in listing:
         if not isinstance(item, dict):
@@ -724,6 +727,11 @@ def _vigieau_reconciled_inventory(
             footer = pq.read_metadata(candidate)
             if footer.num_rows != int(entry["rows"]):
                 raise ValueError(f"Vigieau physical rows changed: {old}")
+            physical_geo = b"geo" in (
+                pq.read_schema(candidate).metadata or {}
+            )
+            if physical_geo != bool(entry["geo"]):
+                raise ValueError(f"Vigieau physical GeoParquet metadata changed: {old}")
             retained[old] = path
             covered[path] = old
         else:
