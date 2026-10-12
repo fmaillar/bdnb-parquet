@@ -416,11 +416,29 @@ def _validate_original_metadata(
             raise ValueError("Vigieau manifest does not match original inputs")
     elif dataset_name == "datatourisme":
         manifest = json.loads((original / "manifest.json").read_text())
-        expected_csv = {item["output"] for item in manifest["csv"]}
-        physical_csv = {p.relative_to(original).as_posix()
-                        for p in (original / "csv").glob("*.parquet")}
+        csv_entries = manifest["csv"]
+        expected_paths = [item["output"] for item in csv_entries]
+        expected_csv = set(expected_paths)
+        physical_csv = {
+            p.relative_to(original).as_posix()
+            for p in (original / "csv").glob("*.parquet")
+        }
+        # A duplicate manifest entry is itself ambiguous: two independent
+        # CSV sources may not silently be assigned the same output.
+        if len(expected_paths) != len(expected_csv):
+            raise ValueError(
+                "DataTourisme CSV manifest has duplicate output references"
+            )
         if physical_csv != expected_csv:
-            raise ValueError("DataTourisme CSV manifest mismatch")
+            missing = sorted(expected_csv - physical_csv)
+            unlisted = sorted(physical_csv - expected_csv)
+            raise ValueError(
+                "DataTourisme CSV manifest mismatch: "
+                f"listed={len(expected_csv)}, physical={len(physical_csv)}, "
+                f"missing_on_disk={len(missing)} {missing[:8]!r}, "
+                f"unlisted_on_disk={len(unlisted)} {unlisted[:8]!r}; "
+                "publication is blocked until discrepancies are audited"
+            )
 
 
 def _validate_stage(
