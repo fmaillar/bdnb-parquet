@@ -512,39 +512,117 @@ def _imope_deduplicated_aliases(
     return found
 
 
-def _manifest_imope(stage: Path, original: Path) -> None:
+def _manifest_imope(
+    stage: Path,
+    original: Path,
+    source_mapping: dict[str, tuple[str, int, int]],
+    dedup_aliases: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Rebuild *physical* files while preserving exact original dedup aliases.
+
+    Original departmental/global totals include 187 manifest-only files.
+    The compacted release must expose physical counts separately from the
+    original logical totals; no duplicated Parquet bytes are materialized.
+    """
     listing = json.loads((original / "manifest.json").read_text(encoding="utf-8"))
     if not isinstance(listing, list):
         raise ValueError("Unexpected IMoPE manifest layout")
-    updated = []
+    updated: list[dict[str, Any]] = []
+    resolved_aliases: list[dict[str, Any]] = []
     for dept in listing:
         name = dept["department"]
         directory = stage / name
         if not directory.is_dir():
             raise ValueError(f"IMoPE department missing: {name}")
+        old_physical_rows = 0
+        old_missing_rows = 0
+        old_files = 0
+        for entry in dept["parquet"]:
+            old_files += 1
+            original_rel = (Path(name) / relative_path(entry["path"])).as_posix()
+            if original_rel in dedup_aliases:
+                old_missing_rows += int(entry["rows"])
+            else:
+                old_physical_rows += int(entry["rows"])
+        if old_physical_rows + old_missing_rows != int(dept["rows"]):
+            raise ValueError(f"IMoPE source manifest rows disagree: {name}")
+
         parts = sorted(directory.glob("*.parquet"))
         descriptions = [validate_parquet(p) for p in parts]
-        if sum(int(x["rows"]) for x in descriptions) != dept["rows"]:
-            raise ValueError(f"IMoPE department rows changed: {name}")
-        updated.append({
-            **dept, "files": len(parts),
+        physical_rows = sum(int(x["rows"]) for x in descriptions)
+        if physical_rows != old_physical_rows:
+            raise ValueError(
+                f"IMoPE physical department rows changed: {name}: "
+                f"{physical_rows} != {old_physical_rows}"
+            )
+
+        department_aliases = []
+        for old, alias in sorted(dedup_aliases.items()):
+            if Path(old).parent != Path(name):
+                continue
+            original_canon = alias["canonical"]
+            published, offset, rows = source_mapping.get(
+                original_canon,
+                (original_canon, 0, int(alias["original_metadata"]["rows"])),
+            )
+            if rows != int(alias["original_metadata"]["rows"]):
+                raise ValueError(f"IMoPE canonical source rows changed: {old}")
+            target = stage / published
+            if (not target.is_file()
+                or target.is_symlink()
+                or pq.read_metadata(target).num_rows < offset + rows):
+                raise ValueError(
+                    f"IMoPE canonical mapping cannot be resolved after "
+                    f"compaction: {old} -> {published}"
+                )
+            record = {
+                **alias,
+                "published": published,
+                "first_row": offset,
+                "rows": rows,
+            }
+            resolved_aliases.append(record)
+            department_aliases.append(record)
+
+        updated_entry = {
+            **dept,
+            "files": len(parts),
+            "rows": physical_rows,
             "bytes": sum(x["bytes"] for x in descriptions),
             "geo_files": sum(x["geo"] for x in descriptions),
             "parquet": descriptions,
             "compacted": True,
-        })
-        replace_json(directory / "_SUCCESS.json", updated[-1])
+            "original_manifest_files": old_files,
+            "original_logical_rows": int(dept["rows"]),
+            "aliased_rows": old_missing_rows,
+            "deduplicated_aliases": department_aliases,
+        }
+        updated.append(updated_entry)
+        replace_json(directory / "_SUCCESS.json", updated_entry)
+
+    if len(resolved_aliases) != len(dedup_aliases):
+        raise ValueError("Unresolved IMoPE departmental aliases")
     dataset = json.loads((original / "dataset.json").read_text(encoding="utf-8"))
-    if int(dataset["rows"]) != sum(x["rows"] for x in updated):
-        raise ValueError("IMoPE total rows changed")
+    total_logical_rows = sum(int(x["original_logical_rows"]) for x in updated)
+    total_physical_rows = sum(int(x["rows"]) for x in updated)
+    if int(dataset["rows"]) != total_logical_rows:
+        raise ValueError("IMoPE source dataset logical rows changed")
+    if total_physical_rows + sum(int(x["rows"]) for x in resolved_aliases) != total_logical_rows:
+        raise ValueError("IMoPE deduplicated alias row totals disagree")
     dataset.update({
         "files": sum(x["files"] for x in updated),
+        "rows": total_physical_rows,
         "bytes": sum(x["bytes"] for x in updated),
         "geo_files": sum(x["geo_files"] for x in updated),
-        "storage": "verified compacted Parquet with per-source row range index",
+        "original_manifest_files": sum(x["original_manifest_files"] for x in updated),
+        "original_logical_rows": total_logical_rows,
+        "deduplicated_alias_files": len(resolved_aliases),
+        "deduplicated_alias_rows": sum(int(x["rows"]) for x in resolved_aliases),
+        "storage": "verified compacted Parquet with SHA-256 authenticated logical aliases",
     })
     replace_json(stage / "manifest.json", updated)
     replace_json(stage / "dataset.json", dataset)
+    return resolved_aliases
 
 
 def _vigieau_current_output(dataset_root: Path, stored: str) -> str:
