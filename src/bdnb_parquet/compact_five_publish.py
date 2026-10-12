@@ -110,12 +110,21 @@ def require_known_metadata(
 
 
 def validate_source_matches_plan(
-    original: Path, source_root: Path, inventory: dict[str, int],
+    original: Path, dataset_key: str, inventory: dict[str, int],
     selected: list[tuple[str, Any, str]],
 ) -> None:
-    """Refuse extra/missing Parquet inputs and altered planned candidates."""
-    parquet_files = {p.relative_to(source_root).as_posix(): p
-                     for p in original.rglob("*.parquet")}
+    """Compare physical native files to the original planner-relative names.
+
+    Both mount aliases can reference the same inodes but have distinct path
+    prefixes. Compute relative paths within the physical dataset, then
+    prepend the plan's fixed logical dataset prefix. Never call relative_to()
+    between the bind-mount and native-mount roots.
+    """
+    prefix = Path(TARGETS[dataset_key])
+    parquet_files = {
+        (prefix / p.relative_to(original)).as_posix(): p
+        for p in original.rglob("*.parquet")
+    }
     if len(parquet_files) != inventory["source_files"]:
         raise ValueError(
             f"Source file count changed: {original}: "
@@ -599,7 +608,7 @@ def publish(
             raise RuntimeError(f"Existing stage: {stage}; inspect before retry")
         if backup.exists() or backup.is_symlink():
             raise RuntimeError(f"Existing backup: {backup}; inspect before retry")
-        validate_source_matches_plan(directory, root, inventory[key], grouped[key])
+        validate_source_matches_plan(directory, key, inventory[key], grouped[key])
         _validate_original_metadata(key, root / TARGETS[key])
         require_known_metadata(key, root / TARGETS[key], grouped[key])
         if execute:
