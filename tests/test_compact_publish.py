@@ -1,4 +1,8 @@
+import errno
 import json
+import os
+from types import SimpleNamespace
+from unittest.mock import patch
 import tempfile
 import unittest
 from pathlib import Path
@@ -93,6 +97,26 @@ class PublishCompactionTests(unittest.TestCase):
             "compact_root": self.output_root,
             "tables_relative": self.tables_root,
         }
+
+    def test_read_only_dataset_fails_before_compaction_or_verification(self):
+        args = [
+            "--plan-dir", str(self.plan_dir),
+            "--source-root", str(self.root),
+            "--output-root", str(self.output_root),
+            "--tables-root", self.tables_root,
+            "--execute", "--prune-originals",
+        ]
+        with patch(
+            "bdnb_parquet.compact_publish.os.statvfs",
+            return_value=SimpleNamespace(f_flag=os.ST_RDONLY),
+        ):
+            self.assertEqual(compact_all_main(args), 1)
+            with self.assertRaises(OSError) as caught:
+                publish(**self.kwargs(), prune_backup=True)
+            self.assertEqual(caught.exception.errno, errno.EROFS)
+        self.assertFalse(self.output_root.exists())
+        self.assertFalse(self.dataset.with_name("bdnb.compaction-stage").exists())
+        self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 4)
 
     def test_missing_compacted_output_does_not_touch_original(self):
         old_files = list(self.tables.rglob("*.parquet"))
