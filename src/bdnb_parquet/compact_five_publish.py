@@ -265,10 +265,25 @@ def _datatourisme_csv_inventory(
         for item in folder.rglob("*.parquet")
     } if folder.is_dir() else set()
     extras = sorted(physical - set(by_path))
-    if extras:
+    missing = sorted(set(by_path) - physical)
+    unsafe_missing = [
+        name for name in missing
+        if (
+            type(by_path[name].get("rows")) is not int
+            or type(by_path[name].get("row_groups")) is not int
+            or by_path[name]["rows"] != 0
+            or by_path[name]["row_groups"] != 0
+            or (original / name).exists()
+            or (original / name).is_symlink()
+        )
+    ]
+    if extras or unsafe_missing:
         raise ValueError(
             "DataTourisme CSV manifest mismatch: "
-            f"unlisted_on_disk={len(extras)} {extras[:8]!r}"
+            f"missing_on_disk={len(missing)} {missing[:8]!r}, "
+            f"unlisted_on_disk={len(extras)} {extras[:8]!r}, "
+            f"unverified_missing={len(unsafe_missing)} "
+            f"{unsafe_missing[:8]!r}"
         )
     kept: list[dict[str, Any]] = []
     omitted: list[dict[str, Any]] = []
@@ -284,16 +299,8 @@ def _datatourisme_csv_inventory(
                 )
             kept.append(entry)
         else:
-            if (type(entry.get("rows")) is not int
-                or type(entry.get("row_groups")) is not int
-                or entry["rows"] != 0 or entry["row_groups"] != 0
-                or path.exists() or path.is_symlink()):
-                raise ValueError(
-                    "DataTourisme CSV manifest mismatch: "
-                    f"missing nonempty or unverified output: {name}, "
-                    f"rows={entry.get('rows')!r}, "
-                    f"row_groups={entry.get('row_groups')!r}"
-                )
+            # Already validated against the exact zero-row/zero-row-group
+            # exception above, with no unlisted physical CSV files.
             omitted.append({
                 **entry,
                 "reason": "manifest-only CSV output absent from disk; "
