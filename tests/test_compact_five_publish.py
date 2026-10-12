@@ -239,6 +239,27 @@ class FiveDatasetPublicationTests(unittest.TestCase):
             (self.dirs["datatourisme"] / "ntriples/snap/part-00002.parquet").exists()
         )
 
+    def test_refuse_nonconsecutive_nt_fragment_compaction(self):
+        # A changed-schema part between two same-schema parts must not be
+        # reordered merely because the planner groups identical schemas.
+        middle = self.dirs["datatourisme"] / "ntriples/snap/part-00001.parquet"
+        pq.write_table(
+            pa.table({"different_schema": [1, 2, 3, 4]}),
+            middle,
+            compression="zstd",
+        )
+        new_plan = self.base / "noncontiguous-plan"
+        write_report(
+            self.root.resolve(), new_plan, MIB,
+            plan(scan(self.root.resolve()), MIB),
+        )
+        with self.assertRaisesRegex(ValueError, "Non-contiguous NTriples"):
+            publish(
+                plan_dir=new_plan, source_root=self.root,
+                output_root=self.outputs, writable_source_root=None,
+                prune_backup=False, execute=False, min_free_gib=0,
+            )
+
     def test_cross_mount_verified_copies_publish_all_five(self):
         real_link = os.link
 
