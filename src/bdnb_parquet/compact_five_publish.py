@@ -443,6 +443,25 @@ def _validate_stage(
     }
 
 
+def _restore_directory_modes(stage: Path, original: Path) -> None:
+    """Restore the snapshot's directory protections after stage construction.
+
+    Staging is necessarily writable while building the new tree. Original
+    converters often use mode 0555 for immutable dataset directories.
+    Reapply all original directory modes just before publication.
+    """
+    directories = [original, *(
+        p for p in original.rglob("*") if p.is_dir()
+    )]
+    for directory in directories:
+        if directory.is_symlink():
+            raise ValueError(f"Unsafe directory symlink: {directory}")
+        target = stage / directory.relative_to(original)
+        if not target.is_dir() or target.is_symlink():
+            raise ValueError(f"Missing staging directory: {target}")
+        os.chmod(target, stat.S_IMODE(directory.stat().st_mode))
+
+
 def _build_stage(
     key: str, dataset: Path, stage: Path, source_root: Path,
     publish_root: Path, output_root: Path,
@@ -500,6 +519,7 @@ def _build_stage(
     )
     summary = {"dataset": key, **totals, "verified_batches": len(selected)}
     replace_json(stage / "_COMPACTION.json", summary)
+    _restore_directory_modes(stage, dataset)
     return summary
 
 
