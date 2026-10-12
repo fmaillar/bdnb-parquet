@@ -239,6 +239,71 @@ class FiveDatasetPublicationTests(unittest.TestCase):
             (self.dirs["datatourisme"] / "ntriples/snap/part-00002.parquet").exists()
         )
 
+    def test_cross_mount_verified_copies_publish_all_five(self):
+        real_link = os.link
+
+        def cross_mount_exdev(source, destination, *args, **kwargs):
+            # Simulate separate VFS mount IDs; the publisher must copy and
+            # SHA-256-verify instead of attempting to recompact inputs.
+            raise OSError(18, "Invalid cross-device link")
+
+        with patch("bdnb_parquet.compact_publish.os.link",
+                   side_effect=cross_mount_exdev):
+            self.assertEqual(self.run_pub("--execute", "--prune-backup"), 0)
+        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 7)
+        self.assertTrue(all(
+            (directory / "_COMPACTION_SOURCES.json").is_file()
+            for directory in self.dirs.values()
+        ))
+
+    def test_datatourisme_csv_grouping_preserves_logical_source_ranges(self):
+        csv_dir = self.dirs["datatourisme"] / "csv"
+        second = csv_dir / "second.parquet"
+        self.write_part(second, "csv", 1)
+        manifest_path = self.dirs["datatourisme"] / "manifest.json"
+        original = json.loads(manifest_path.read_text())
+        original["csv"].append({
+            "source": "second.csv", "output": "csv/second.parquet",
+            "rows": 4, "bytes": second.stat().st_size,
+        })
+        original["rows"] += 4
+        original["bytes"] += second.stat().st_size
+        self.put_json(manifest_path, original)
+        dataset_path = self.dirs["datatourisme"] / "dataset.json"
+        dataset = json.loads(dataset_path.read_text())
+        dataset["rows"] += 4
+        dataset["bytes"] += second.stat().st_size
+        self.put_json(dataset_path, dataset)
+        replan = self.base / "replan"
+        outputs = self.base / "reoutputs"
+        write_report(
+            self.root.resolve(), replan, MIB,
+            plan(scan(self.root.resolve()), MIB),
+        )
+        self.assertEqual(compact_main([
+            "--plan-dir", str(replan),
+            "--source-root", str(self.root),
+            "--output-root", str(outputs),
+            "--min-free-gib", "0",
+            "--execute", "--include-independent-files",
+        ]), 0)
+        report = publish(
+            plan_dir=replan, source_root=self.root,
+            output_root=outputs, writable_source_root=None,
+            prune_backup=True, execute=True, min_free_gib=0,
+        )
+        self.assertEqual(report["verified_batches"], 6)
+        metadata = json.loads(manifest_path.read_text())
+        records = metadata["csv"]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["output"], records[1]["output"])
+        self.assertEqual(
+            sorted(e["row_offset"] for e in records), [0, 4],
+        )
+        self.assertTrue(
+            (self.dirs["datatourisme"] / records[0]["output"]).is_file()
+        )
+
     def test_backup_preserved_when_not_pruned(self):
         report = publish(
             plan_dir=self.plan, source_root=self.root,
