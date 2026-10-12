@@ -563,6 +563,15 @@ def publish(
         reject_overlapping_trees(src, output_root)
         reject_overlapping_trees(src, plan_dir)
     selected, inventory = read_plan(plan_dir, root)
+    nt_root = Path(TARGETS["datatourisme"]) / "ntriples"
+    for key, selection, category in selected:
+        if (key == "datatourisme"
+            and Path(selection.directory).is_relative_to(nt_root)
+            and category != "part-sequence"):
+            raise ValueError(
+                f"Non-contiguous NTriples part group cannot safely be "
+                f"published: {selection.batch_id}"
+            )
     expected = provenance_manifest(selected, output_root, plan_dir)
     provenance_file = output_root / "_meta" / "five-datasets-provenance.json"
     if not provenance_file.is_file() or (
