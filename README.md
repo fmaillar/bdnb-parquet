@@ -643,8 +643,24 @@ bdnb-parquet-compact-five-publish \
   --writable-source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet \
   --output-root /mnt/data/parquet-compaction-other5 \
   --duplicates-catalog /mnt/data/datasets/release-parquet-plan/_meta/duplicates.tsv \
-  --execute --prune-backup
+  --workers 4 --threads 2 \
+  --execute
 ```
+
+The verification phase can reuse the proven **4 worker processes × 2
+Arrow threads** configuration via `--workers 4 --threads 2`.
+The worker pool performs only read-only output-audit and complete
+ordered Arrow equality checks. At most four batches are in flight;
+if any fails, no staging or directory swaps take place. The source
+tree staging, manifest rewrites, five directory swaps and rollback
+remain sequential. On a mechanical HDD this configuration is not
+guaranteed faster than fewer workers; measure actual progress.
+
+Keep `--prune-backup` **off for the first real publication** so the five
+`.precompact-backup` directories are preserved until post-publication
+verification. `--workers` is limited to 1–4; `--threads` must be
+positive. Dry-run remains read-only and does not run bulk Arrow
+comparisons.
 
 The publisher verifies all 497 compressed outputs against every original
 Arrow value and schema, stages **all five** dataset replacement trees with
