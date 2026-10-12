@@ -196,6 +196,94 @@ class FiveDatasetPublicationTests(unittest.TestCase):
             ).exists()
         )
 
+    def test_missing_zero_row_csv_manifest_entry_is_reconciled_and_audited(self):
+        manifest_path = self.dirs["datatourisme"] / "manifest.json"
+        dataset_path = self.dirs["datatourisme"] / "dataset.json"
+        original = json.loads(manifest_path.read_text(encoding="utf-8"))
+        missing = {
+            "source": "datatourisme-reg-myt.csv",
+            "output": "csv/datatourisme-reg-myt.parquet",
+            "rows": 0, "row_groups": 0, "bytes": 2886,
+            "resumed": False,
+        }
+        original["csv"].append(missing)
+        original["csv_files"] = len(original["csv"])
+        original["bytes"] += missing["bytes"]
+        self.put_json(manifest_path, original)
+        dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+        dataset.update({
+            "csv_files": len(original["csv"]), "bytes": original["bytes"],
+        })
+        self.put_json(dataset_path, dataset)
+
+        # The preflight must be strictly read-only and accept ONLY this
+        # zero-row discrepancy. The source JSON must remain unchanged.
+        before = manifest_path.read_bytes()
+        self.assertEqual(self.run_pub(), 0)
+        self.assertEqual(manifest_path.read_bytes(), before)
+        self.assertFalse(
+            (self.dirs["datatourisme"] / "csv/datatourisme-reg-myt.parquet").exists()
+        )
+
+        result = publish(
+            plan_dir=self.plan, source_root=self.root,
+            output_root=self.outputs, writable_source_root=None,
+            prune_backup=True, execute=True, min_free_gib=0,
+        )
+        self.assertEqual(result["verified_batches"], 5)
+        new_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(new_manifest["csv"]), 1)
+        self.assertEqual(new_manifest["csv_files"], 1)
+        self.assertEqual(new_manifest["rows"], 16)
+        self.assertEqual(new_manifest["bytes"], original["bytes"] - 2886 - (
+            original["csv"][0]["bytes"]
+            - (self.dirs["datatourisme"] / "csv/dataset.parquet").stat().st_size
+        ) - (
+            original["ntriples"][0]["bytes"]
+            - sum(
+                p.stat().st_size for p in (
+                    self.dirs["datatourisme"] / "ntriples/snap"
+                ).glob("*.parquet")
+            )
+        ))
+        omitted = new_manifest["compaction_omitted_empty_csv"]
+        self.assertEqual(len(omitted), 1)
+        self.assertEqual(omitted[0]["output"], missing["output"])
+        self.assertEqual(omitted[0]["rows"], 0)
+        self.assertEqual(omitted[0]["row_groups"], 0)
+        new_dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+        self.assertEqual(new_dataset["csv_files"], 1)
+        self.assertEqual(new_dataset["compaction_omitted_empty_csv"], omitted)
+        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 7)
+
+    def test_missing_nonempty_csv_manifest_entry_fails_closed(self):
+        manifest_path = self.dirs["datatourisme"] / "manifest.json"
+        original = json.loads(manifest_path.read_text(encoding="utf-8"))
+        original["csv"].append({
+            "source": "missing.csv",
+            "output": "csv/missing.parquet",
+            "rows": 1, "row_groups": 1, "bytes": 2886,
+        })
+        self.put_json(manifest_path, original)
+        self.assertEqual(self.run_pub(), 1)
+        self.assertTrue((self.dirs["datatourisme"] / "csv/dataset.parquet").is_file())
+        self.assertFalse(
+            self.dirs["datatourisme"].with_name(
+                "datatourisme.precompact-backup"
+            ).exists()
+        )
+
+    def test_missing_zero_row_csv_with_nonzero_row_groups_fails_closed(self):
+        manifest_path = self.dirs["datatourisme"] / "manifest.json"
+        original = json.loads(manifest_path.read_text(encoding="utf-8"))
+        original["csv"].append({
+            "source": "missing.csv",
+            "output": "csv/missing.parquet",
+            "rows": 0, "row_groups": 1, "bytes": 2886,
+        })
+        self.put_json(manifest_path, original)
+        self.assertEqual(self.run_pub(), 1)
+
     def test_preview_does_not_modify_sources(self):
         self.assertEqual(self.run_pub(), 0)
         self.assertEqual(len(list(self.root.rglob("*.parquet"))), 13)
