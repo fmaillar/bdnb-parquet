@@ -10,8 +10,10 @@ from unittest.mock import patch
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from bdnb_parquet.compact_five import TARGETS, main as compact_main
-from bdnb_parquet.compact_five_publish import main as publish_main, publish
+from bdnb_parquet.compact_five import TARGETS, main as compact_main, read_plan
+from bdnb_parquet.compact_five_publish import (
+    main as publish_main, publish, validate_source_matches_plan,
+)
 from bdnb_parquet.compact_parquet import MIB, plan, scan, write_report
 from bdnb_parquet.imope_promote import validate_parquet
 
@@ -139,6 +141,37 @@ class FiveDatasetPublicationTests(unittest.TestCase):
             "--output-root", str(self.outputs),
             "--min-free-gib", "0", *args,
         ])
+
+    def test_source_plan_alias_and_native_dataset_paths_are_distinct(self):
+        # A bind mount may expose the exact same dataset under two textually
+        # different parent paths; never call Path.relative_to(bind_root)
+        # on a file enumerated through the native dataset prefix.
+        native_alias = self.base / "native-alias"
+        native_alias.symlink_to(self.root, target_is_directory=True)
+        selected, inventory = read_plan(self.plan, self.root.resolve())
+        for dataset_key, prefix in TARGETS.items():
+            original = native_alias / prefix
+            groups = [entry for entry in selected if entry[0] == dataset_key]
+            self.assertNotEqual(
+                (original / "placeholder.parquet").parent,
+                self.root / prefix,
+            )
+            validate_source_matches_plan(
+                original, dataset_key, inventory[dataset_key], groups,
+            )
+        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 13)
+
+    def test_physical_native_dataset_extra_file_is_rejected(self):
+        selected, inventory = read_plan(self.plan, self.root.resolve())
+        self.write_part(
+            self.dirs["waldec"] / "by-source" / "new-unplanned.parquet",
+            "waldec", 99,
+        )
+        with self.assertRaisesRegex(ValueError, "Source file count changed"):
+            validate_source_matches_plan(
+                self.dirs["waldec"], "waldec", inventory["waldec"],
+                [entry for entry in selected if entry[0] == "waldec"],
+            )
 
     def test_preview_does_not_modify_sources(self):
         self.assertEqual(self.run_pub(), 0)
