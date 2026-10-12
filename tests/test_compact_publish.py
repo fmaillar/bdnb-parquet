@@ -184,6 +184,29 @@ class PublishCompactionTests(unittest.TestCase):
         )
         self.assertTrue((self.dataset / "_COMPACTION.json").exists())
 
+    def test_prune_with_read_only_original_directories(self):
+        self.compact()
+        for directory in (
+            self.dataset,
+            self.dataset / "schemas",
+            self.tables,
+            self.tables / "many",
+            self.tables / "singleton",
+        ):
+            directory.chmod(0o555)
+        result = publish(**self.kwargs(), prune_backup=True)
+        self.assertTrue(result["pruned"])
+        self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 2)
+        self.assertFalse(
+            self.dataset.with_name("bdnb.precompact-backup").exists()
+        )
+        self.assertEqual(
+            pq.read_metadata(
+                self.tables / "many" / "part-00000.parquet"
+            ).num_rows,
+            15,
+        )
+
     def test_preserve_original_backup_by_default(self):
         self.compact()
         report = publish(**self.kwargs(), prune_backup=False)
