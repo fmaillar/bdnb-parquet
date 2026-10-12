@@ -97,7 +97,9 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("BDNB dataset paths do not refer to the same data")
         require_writable_publication_parent(publish_dataset)
         output_root.mkdir(parents=True, exist_ok=True)
-        require_hardlink_compatible(output_root, publish_dataset)
+        require_hardlink_compatible(
+            output_root, publish_dataset, min_free_gib=args.min_free_gib,
+        )
         if not selections:
             raise ValueError("No BDNB compaction batches in source plan")
         results = run_schedule(
@@ -122,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
             root, plan_dir, output_root, args.tables_root,
             prune_backup=args.prune_originals,
             writable_source_root=publish_root,
+            min_free_gib=args.min_free_gib,
         )
         print(
             "COMPLETE: "
