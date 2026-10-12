@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -379,6 +380,15 @@ def require_writable_publication_parent(dataset: Path) -> None:
                 "inspect findmnt -T for this path before retrying",
                 str(path),
             )
+
+    # A mount can be rw yet the invoking user lacks permission to create
+    # siblings of the BDNB directory. Probe the actual operation BEFORE
+    # revalidating every compacted batch (can take tens of minutes).
+    probe = Path(tempfile.mkdtemp(
+        prefix=".bdnb-compaction-permission-check-",
+        dir=dataset.parent,
+    ))
+    probe.rmdir()
 
 
 def publish(
