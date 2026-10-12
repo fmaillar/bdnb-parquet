@@ -635,6 +635,64 @@ class FiveDatasetPublicationTests(unittest.TestCase):
         self.assertTrue((self.dirs["vigieau"] / "geojson/2025/arretes-2025-12-01.parquet").exists())
         self.assertFalse(self.dirs["vigieau"].with_name("vigieau.compaction-stage").exists())
 
+    def test_parallel_verification_four_workers_two_arrow_threads(self):
+        # Mirror the already-tested five-dataset compaction resource limits.
+        # The final swap remains sequential and all original backups remain.
+        report = publish(
+            plan_dir=self.plan, source_root=self.root,
+            output_root=self.outputs, writable_source_root=None,
+            prune_backup=False, execute=True, min_free_gib=0,
+            workers=4, threads=2,
+        )
+        self.assertEqual(report["verified_batches"], 5)
+        self.assertEqual(report["verification_workers"], 4)
+        self.assertEqual(report["arrow_threads_per_worker"], 2)
+        self.assertEqual(report["published_files"], 6)
+        for key, path in self.dirs.items():
+            self.assertTrue((path / "_COMPACTION_SOURCES.json").is_file(), key)
+            self.assertTrue(
+                path.with_name(path.name + ".precompact-backup").is_dir(), key,
+            )
+
+    def test_parallel_verification_rejects_corrupt_output_before_swaps(self):
+        bad = next(self.outputs.rglob("compact-*.parquet"))
+        bad.write_bytes(b"corrupted")
+        self.assertEqual(
+            self.run_pub("--execute", "--workers", "4", "--threads", "2"),
+            1,
+        )
+        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 13)
+        for key, path in self.dirs.items():
+            self.assertFalse(
+                path.with_name(path.name + ".compaction-stage").exists(), key,
+            )
+            self.assertFalse(
+                path.with_name(path.name + ".precompact-backup").exists(), key,
+            )
+
+    def test_parallel_flags_dry_run_never_verify_or_modify(self):
+        with patch(
+            "bdnb_parquet.compact_five_publish.verify_outputs",
+            side_effect=AssertionError("dry-run must not verify bulk output"),
+        ):
+            self.assertEqual(
+                self.run_pub("--workers", "4", "--threads", "2"), 0,
+            )
+        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 13)
+
+    def test_verification_rejects_invalid_worker_limits(self):
+        for workers, threads in ((0, 2), (5, 2), (4, 0)):
+            with self.subTest(workers=workers, threads=threads):
+                with self.assertRaisesRegex(
+                    ValueError, "Verification requires",
+                ):
+                    publish(
+                        plan_dir=self.plan, source_root=self.root,
+                        output_root=self.outputs, writable_source_root=None,
+                        prune_backup=False, execute=False, min_free_gib=0,
+                        workers=workers, threads=threads,
+                    )
+
     def test_publish_all_five_and_prune(self):
         before = self.excluded.read_bytes()
         report = publish(
