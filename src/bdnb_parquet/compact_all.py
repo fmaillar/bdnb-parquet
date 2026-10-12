@@ -12,7 +12,12 @@ import sys
 from pathlib import Path
 
 from .compact_inventory import checked_tables_root
-from .compact_publish import inspect_plan, publish, selections_for_dataset
+from .compact_publish import (
+    inspect_plan,
+    publish,
+    require_writable_publication_parent,
+    selections_for_dataset,
+)
 from .compact_run import reject_overlapping_trees
 from .compact_schedule import run_schedule
 
@@ -74,6 +79,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(overview, indent=2), flush=True)
         if not args.execute:
             return 0
+        # Do not spend minutes verifying/scheduling all batches when the
+        # final publication itself cannot write into the original snapshot.
+        require_writable_publication_parent(tables.parent)
         if not selections:
             raise ValueError("No BDNB compaction batches in source plan")
         results = run_schedule(
