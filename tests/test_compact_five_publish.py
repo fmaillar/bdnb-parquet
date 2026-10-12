@@ -511,6 +511,124 @@ class FiveDatasetPublicationTests(unittest.TestCase):
         self.put_json(manifest_path, original)
         self.assertEqual(self.run_pub(), 1)
 
+    def make_vigieau_dedup_aliases(self, *, corrupt_hash=False, missing_catalog=False):
+        """Construct the real three-way Vigieau topology in a small fixture.
+
+        The source manifest records an archive-named path, the physical file
+        was normalized to YYYY, then global SHA256 dedup removed the aliases.
+        """
+        root = self.dirs["vigieau"]
+        manifest = json.loads((root / "manifest.json").read_text())
+        legacy = manifest[0]["output"]
+        first = root / "geojson/2025/arretes-2025-12-01.parquet"
+        baseline = json.loads((root / "dataset.json").read_text())
+        alias1 = dict(manifest[0])
+        alias1["output"] = legacy.replace("12-01", "12-03")
+        alias1["source_member"] = "duplicate-03.geojson"
+        alias2 = dict(manifest[0])
+        alias2["output"] = legacy.replace("12-01", "12-04")
+        alias2["source_member"] = "duplicate-04.geojson"
+        # The canonical externally located in the release's other dataset.
+        alias2["bytes"] = self.excluded.stat().st_size
+        manifest.extend([alias1, alias2])
+        self.put_json(root / "manifest.json", manifest)
+        baseline["parquet_files"] = 4
+        baseline["rows"] = 16
+        baseline["bytes"] += alias1["bytes"] + alias2["bytes"]
+        self.put_json(root / "dataset.json", baseline)
+        path = self.base / "vigieau-duplicates.tsv"
+        with path.open("w", encoding="utf-8", newline="") as output:
+            writer = csv.DictWriter(
+                output,
+                delimiter="\t",
+                fieldnames=[
+                    "sha256", "canonical_path", "duplicate_path",
+                    "bytes", "reason",
+                ],
+            )
+            writer.writeheader()
+            records = [
+                (alias1["output"], legacy, first, alias1["bytes"]),
+                (
+                    alias2["output"],
+                    "other-dataset/keep.parquet",
+                    self.excluded, alias2["bytes"],
+                ),
+            ]
+            for deleted, canonical, physical, size in records:
+                if missing_catalog and deleted == alias2["output"]:
+                    continue
+                signature = hashlib.sha256(physical.read_bytes()).hexdigest()
+                if corrupt_hash and deleted == alias1["output"]:
+                    signature = "0" * 64
+                writer.writerow({
+                    "sha256": signature,
+                    "canonical_path": (
+                        f"{TARGETS['vigieau']}/{canonical}"
+                        if canonical == legacy else canonical
+                    ),
+                    "duplicate_path": f"{TARGETS['vigieau']}/{deleted}",
+                    "bytes": size,
+                    "reason": "exact-duplicate",
+                })
+        return path
+
+    def test_vigieau_normalized_and_global_sha_aliases_survive_publish(self):
+        catalog = self.make_vigieau_dedup_aliases()
+        self.assertEqual(
+            self.run_pub("--duplicates-catalog", str(catalog)), 0,
+        )
+        result = publish(
+            plan_dir=self.plan, source_root=self.root,
+            output_root=self.outputs, writable_source_root=None,
+            prune_backup=True, execute=True, min_free_gib=0,
+            duplicates_catalog=catalog,
+        )
+        self.assertEqual(result["verified_batches"], 5)
+        dataset = json.loads((self.dirs["vigieau"] / "dataset.json").read_text())
+        self.assertEqual(dataset["original_manifest_files"], 4)
+        self.assertEqual(dataset["original_logical_rows"], 16)
+        self.assertEqual(dataset["rows"], 8)
+        self.assertEqual(dataset["parquet_files"], 1)
+        self.assertEqual(dataset["deduplicated_alias_files"], 2)
+        self.assertEqual(dataset["deduplicated_alias_rows"], 8)
+        sources = json.loads(
+            (self.dirs["vigieau"] / "_COMPACTION_SOURCES.json").read_text()
+        )
+        aliases = sources["deduplicated_aliases"]
+        self.assertEqual(len(aliases), 2)
+        internal = next(x for x in aliases if x["scope"] == "vigieau")
+        external = next(x for x in aliases if x["scope"] == "release")
+        self.assertEqual(internal["canonical"], "geojson/2025/arretes-2025-12-01.parquet")
+        self.assertTrue(internal["published"].startswith("geojson/2025/compact-"))
+        self.assertEqual(internal["first_row"], 0)
+        self.assertEqual(internal["rows"], 4)
+        self.assertEqual(external["published"], "parquet/other-dataset/keep.parquet")
+        self.assertEqual(external["rows"], 4)
+        output = json.loads((self.dirs["vigieau"] / "manifest.json").read_text())
+        self.assertEqual(len(output), 1)
+        self.assertEqual(output[0]["rows"], 8)
+        self.assertEqual(len(output[0]["original_sources"]), 2)
+        self.assertEqual(len(list(self.dirs["vigieau"].rglob("*.parquet"))), 1)
+
+    def test_vigieau_full_manifest_requires_exact_catalog(self):
+        catalog = self.make_vigieau_dedup_aliases(missing_catalog=True)
+        self.assertEqual(
+            self.run_pub("--duplicates-catalog", str(catalog)), 1,
+        )
+        self.assertTrue(
+            (self.dirs["vigieau"] / "geojson/2025/arretes-2025-12-01.parquet").is_file()
+        )
+
+    def test_vigieau_sha256_mismatch_rejected(self):
+        catalog = self.make_vigieau_dedup_aliases(corrupt_hash=True)
+        self.assertEqual(
+            self.run_pub("--duplicates-catalog", str(catalog)), 1,
+        )
+        self.assertFalse(self.dirs["vigieau"].with_name(
+            "vigieau.precompact-backup"
+        ).exists())
+
     def test_preview_does_not_modify_sources(self):
         self.assertEqual(self.run_pub(), 0)
         self.assertEqual(len(list(self.root.rglob("*.parquet"))), 13)
