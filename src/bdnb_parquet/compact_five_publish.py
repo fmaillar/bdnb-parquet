@@ -32,6 +32,7 @@ from .compact_run import output_paths, reject_overlapping_trees, verify
 from .convert import atomic_json
 from .datatourisme_convert import nt_snapshot_name
 from .imope_promote import validate_parquet
+from .normalize_vigieau import YEAR_DIR_RE
 
 PART = re.compile(r"part-(\d{5,})\.parquet\Z")
 GIB = 2**30
@@ -309,6 +310,26 @@ def _manifest_imope(stage: Path, original: Path) -> None:
     replace_json(stage / "dataset.json", dataset)
 
 
+def _vigieau_current_output(dataset_root: Path, stored: str) -> str:
+    """Resolve only the known, deterministic Vigieau year-normalization move.
+
+    normalize_vigieau.py relocated archive-named directories to geojson/YYYY
+    without rewriting manifest.json. Never fall back to fuzzy filenames.
+    """
+    rel = Path(stored)
+    if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+        raise ValueError(f"Unsafe Vigieau path in manifest: {stored}")
+    if (dataset_root / rel).is_file():
+        return rel.as_posix()
+    if len(rel.parts) >= 3 and rel.parts[0] == "geojson":
+        match = YEAR_DIR_RE.fullmatch(rel.parts[1])
+        if match:
+            normalized = Path("geojson") / match.group(1) / Path(*rel.parts[2:])
+            if (dataset_root / normalized).is_file():
+                return normalized.as_posix()
+    raise ValueError(f"Unresolved Vigieau manifest path: {stored}")
+
+
 def _manifest_vigieau(
     stage: Path, original: Path,
     old_to_stage: dict[str, tuple[str, int, int]],
@@ -318,7 +339,8 @@ def _manifest_vigieau(
         raise ValueError("Unexpected Vigieau manifest layout")
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for entry in listing:
-        old = entry["output"]
+        legacy = entry["output"]
+        old = _vigieau_current_output(original, legacy)
         rel, offset, num_rows = old_to_stage.get(
             old, (old, 0, int(entry["rows"])),
         )
@@ -326,6 +348,7 @@ def _manifest_vigieau(
             raise ValueError(f"Vigieau source rows changed: {old}")
         grouped[rel].append({
             **entry, "original_output": old,
+            "legacy_output": legacy,
             "row_offset": offset, "row_count": num_rows,
         })
     updated = []
@@ -376,7 +399,8 @@ def _validate_original_metadata(
             raise ValueError("IMoPE manifest misses or duplicates physical inputs")
     elif dataset_name == "vigieau":
         listing = json.loads((original / "manifest.json").read_text())
-        paths = [item["output"] for item in listing]
+        paths = [_vigieau_current_output(original, item["output"])
+                 for item in listing]
         physical = {p.relative_to(original).as_posix()
                     for p in original.rglob("*.parquet")}
         if len(paths) != len(set(paths)) or physical != set(paths):
