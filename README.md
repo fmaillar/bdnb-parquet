@@ -600,6 +600,21 @@ exact row range. Published metadata separates physical
 `rows` from `original_logical_rows` and preserves all aliases in
 `deduplicated_aliases` without recreating physical duplicates.
 
+Vigieau's legacy converter manifest has **4,721 records**, but the release
+contains **2,338 physical Parquet files**. The release-generation pipeline
+moved 2,322 surviving GeoJSON files from archive-named folders to
+`geojson/YYYY`, left 16 paths unchanged, and deduplicated 2,383
+additional logical records by SHA-256. Preflight now checks **every**
+original record against one of these three mechanisms and refuses any
+unlisted physical files, duplicate original paths, unresolvable canonicals,
+size differences, Parquet row mismatches, or SHA-256 mismatches. The
+published `dataset.json` distinguishes the physical **1,330,462**
+rows from the legacy **1,571,878** logical rows, including **241,416**
+rows represented by aliases. Every alias retains its original name,
+canonical SHA-256, release path, and final published physical row range
+under `_COMPACTION_SOURCES.json`; the new manifest lists physical files
+only. No duplicate Parquet files are recreated.
+
 The preflight checks the old plan against the actual dataset file counts,
 inspects converter manifests and rejects missing, changed or unrecognized
 source references (including unexpectedly stale JSON sidecars). A narrow
