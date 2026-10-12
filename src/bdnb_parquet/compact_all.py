@@ -16,6 +16,7 @@ from .compact_publish import (
     inspect_plan,
     publish,
     require_writable_publication_parent,
+    require_hardlink_compatible,
     selections_for_dataset,
 )
 from .compact_run import reject_overlapping_trees
@@ -30,6 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--tables-root", required=True)
+    parser.add_argument("--writable-source-root", type=Path)
     parser.add_argument("--workers", type=int, choices=(1, 2, 3, 4), default=4)
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--batch-rows", type=int, default=16384)
@@ -55,11 +57,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.prune_originals and not args.execute:
         parser.error("--prune-originals requires --execute")
     root = args.source_root.expanduser().resolve()
+    publish_root = (
+        args.writable_source_root.expanduser().resolve()
+        if args.writable_source_root is not None
+        else root
+    )
     plan_dir = args.plan_dir.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
     try:
         reject_overlapping_trees(root, output_root)
         reject_overlapping_trees(root, plan_dir)
+        reject_overlapping_trees(publish_root, plan_dir)
+        reject_overlapping_trees(publish_root, output_root)
+        if not root.samefile(publish_root):
+            raise ValueError("--writable-source-root must match --source-root")
         tables = root / checked_tables_root(args.tables_root)
         indexed, totals = inspect_plan(
             plan_dir, root, tables.parent, tables
@@ -81,7 +92,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         # Do not spend minutes verifying/scheduling all batches when the
         # final publication itself cannot write into the original snapshot.
-        require_writable_publication_parent(tables.parent)
+        publish_dataset = publish_root / checked_tables_root(args.tables_root).parent
+        if not tables.parent.samefile(publish_dataset):
+            raise ValueError("BDNB dataset paths do not refer to the same data")
+        require_writable_publication_parent(publish_dataset)
+        require_hardlink_compatible(output_root, publish_dataset)
         if not selections:
             raise ValueError("No BDNB compaction batches in source plan")
         results = run_schedule(
@@ -105,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         report = publish(
             root, plan_dir, output_root, args.tables_root,
             prune_backup=args.prune_originals,
+            writable_source_root=publish_root,
         )
         print(
             "COMPLETE: "
