@@ -222,7 +222,10 @@ def _stage_nt_parts(
         replace_json(stage_dir / "_SUCCESS.json", info)
 
 
-def _manifest_datatourisme(stage: Path, original: Path) -> None:
+def _manifest_datatourisme(
+    stage: Path, original: Path,
+    old_to_stage: dict[str, tuple[str, int, int]],
+) -> None:
     path = original / "manifest.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict) or not isinstance(manifest.get("ntriples"), list):
@@ -238,17 +241,33 @@ def _manifest_datatourisme(stage: Path, original: Path) -> None:
         entry["bytes"] = info["bytes"]
         ntriples_rows += int(info["rows"])
         ntriples_bytes += int(info["bytes"])
-    csv_rows = csv_bytes = 0
+    csv_rows = 0
+    unique_csv: set[str] = set()
+    csv_bytes = 0
     for entry in manifest["csv"]:
-        parquet = stage / entry["output"]
-        if not parquet.is_file() or pq.read_metadata(parquet).num_rows != entry["rows"]:
+        previous = entry["output"]
+        destination, offset, length = old_to_stage.get(
+            previous, (previous, 0, int(entry["rows"]))
+        )
+        parquet = stage / destination
+        if (not parquet.is_file() or
+            offset + length > pq.read_metadata(parquet).num_rows or
+            length != int(entry["rows"])):
             raise ValueError("DataTourisme CSV output changed")
-        csv_rows += int(entry["rows"])
-        csv_bytes += parquet.stat().st_size
+        entry["original_output"] = previous
+        entry["output"] = destination
+        entry["row_offset"] = offset
+        entry["row_count"] = length
+        entry["original_bytes"] = entry["bytes"]
         entry["bytes"] = parquet.stat().st_size
+        csv_rows += length
+        if destination not in unique_csv:
+            unique_csv.add(destination)
+            csv_bytes += parquet.stat().st_size
     if int(manifest["rows"]) != ntriples_rows + csv_rows:
         raise ValueError("DataTourisme total rows changed")
     manifest["bytes"] = ntriples_bytes + csv_bytes
+    manifest["compaction_source_ranges"] = "_COMPACTION_SOURCES.json"
     replace_json(stage / "manifest.json", manifest)
     dataset = json.loads((original / "dataset.json").read_text(encoding="utf-8"))
     dataset.update({"bytes": manifest["bytes"], "rows": manifest["rows"]})
@@ -431,7 +450,7 @@ def _build_stage(
             offset += src.rows
     if key == "datatourisme":
         _stage_nt_parts(stage, original, mapping)
-        _manifest_datatourisme(stage, original)
+        _manifest_datatourisme(stage, original, mapping)
     elif key == "imope":
         _manifest_imope(stage, original)
     elif key == "vigieau":
