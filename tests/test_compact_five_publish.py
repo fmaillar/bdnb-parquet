@@ -64,7 +64,12 @@ class FiveDatasetPublicationTests(unittest.TestCase):
             vigieau_entries.append({
                 "source_file": f"archive-{idx}.zip",
                 "source_member": f"arretes-{idx}.geojson",
-                "output": rel, "rows": 4, "bytes": target.stat().st_size,
+                "output": (
+                    rel.replace("geojson/2025/", "geojson/"
+                                "cartes-des-zones-et-arr-t-s-en-vigueur-geojson-2025/")
+                    if idx == 0 else rel
+                ),
+                "rows": 4, "bytes": target.stat().st_size,
                 "geo": False, "status": "ok",
             })
         self.put_json(self.dirs["vigieau"] / "manifest.json", vigieau_entries)
@@ -169,6 +174,10 @@ class FiveDatasetPublicationTests(unittest.TestCase):
         self.assertEqual(len(vigi), 1)
         self.assertEqual(vigi[0]["rows"], 8)
         self.assertEqual(len(vigi[0]["original_sources"]), 2)
+        self.assertTrue(any(
+            "cartes-des-zones-et-arr-t-s-en-vigueur-geojson-2025"
+            in x["legacy_output"] for x in vigi[0]["original_sources"]
+        ))
         for key, directory in self.dirs.items():
             idx = json.loads((directory / "_COMPACTION_SOURCES.json").read_text())
             self.assertEqual(idx["dataset"], key)
