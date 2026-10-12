@@ -17,7 +17,7 @@ import shutil
 import stat
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -490,12 +490,38 @@ def _validate_original_metadata(
     """Verify legacy manifests cover physical Parquet files before rewriting."""
     if dataset_name == "imope":
         listing = json.loads((original / "manifest.json").read_text())
-        expected = {f"{item['department']}/{p['path']}"
-                    for item in listing for p in item["parquet"]}
-        physical = {p.relative_to(original).as_posix()
-                    for p in original.rglob("*.parquet")}
-        if physical != expected:
-            raise ValueError("IMoPE manifest misses or duplicates physical inputs")
+        if not isinstance(listing, list):
+            raise ValueError("IMoPE manifest must contain a department list")
+        declared_paths: list[str] = []
+        for item in listing:
+            dept = item["department"]
+            if not isinstance(dept, str) or not dept or "/" in dept or dept == "..":
+                raise ValueError(f"Invalid IMoPE department: {dept!r}")
+            for entry in item["parquet"]:
+                rel = relative_path(entry["path"])
+                declared_paths.append((Path(dept) / rel).as_posix())
+        expected = set(declared_paths)
+        physical = {
+            p.relative_to(original).as_posix()
+            for p in original.rglob("*.parquet")
+        }
+        duplicates = sorted(
+            name for name, count in Counter(declared_paths).items()
+            if count > 1
+        )
+        missing = sorted(expected - physical)
+        unlisted = sorted(physical - expected)
+        if missing or unlisted or duplicates:
+            raise ValueError(
+                "IMoPE manifest misses or duplicates physical inputs: "
+                f"manifest_entries={len(declared_paths)}, "
+                f"manifest_unique={len(expected)}, "
+                f"physical={len(physical)}, "
+                f"missing_on_disk={len(missing)} {missing[:12]!r}, "
+                f"unlisted_on_disk={len(unlisted)} {unlisted[:12]!r}, "
+                f"duplicate_references={len(duplicates)} {duplicates[:12]!r}; "
+                "no automatic source deletion is permitted"
+            )
     elif dataset_name == "vigieau":
         listing = json.loads((original / "manifest.json").read_text())
         paths = [_vigieau_current_output(original, item["output"])
