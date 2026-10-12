@@ -587,7 +587,15 @@ bdnb-parquet-compact-five-publish \
 
 The preflight checks the old plan against the actual dataset file counts,
 inspects converter manifests and rejects missing, changed or unrecognized
-source references (including unexpectedly stale JSON sidecars). If a
+source references (including unexpectedly stale JSON sidecars). A narrow
+DataTourisme exception accepts an absent CSV Parquet output only when its
+legacy manifest entry declares **exactly zero rows and zero row groups**,
+and no physical CSV output is unlisted. The staged manifest omits that
+nonexistent output, records its full original entry under
+`compaction_omitted_empty_csv`, and recalculates file counts and byte
+sizes; the original manifest remains unchanged until the final directory
+swap. Any nonempty missing source or ambiguous manifest still blocks
+publication. If a
 dataset has been normalized, the Vigieau converter's known
 `geojson/<archive-year>/...` to `geojson/YYYY/...` move is reconciled
 using the exact rule in `normalize_vigieau.py`; no fuzzy matching.
