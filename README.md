@@ -476,3 +476,37 @@ candidate batches without modifying any data. Use `--execute` without
 mixed-source corpus). Snapshot-level indexes, file hashes and torrent metadata
 outside the BDNB dataset must be regenerated after publication.
 
+### BDNB snapshot mounted through a read-only Transmission bind mount
+
+A snapshot mounted as
+`/mnt/data/torrents/download/france-open-data-parquet-2026-10-10`
+from `/mnt/data/datasets/france-open-data-parquet-2026-10-10`
+has a **different mount ID** from the writable `/mnt/data` root.
+Linux returns EXDEV for hardlinks across the bind mount even if the
+underlying ext4 filesystem is identical.
+
+For the final **publication-only** run, use the native physical mount alias.
+The planner stays anchored to its original --source-root and the tool requires
+both source roots to identify the same physical directory (same inode). It
+probes both the ability to create a staging directory and a real cross-path
+hardlink **before** verifying any of the candidate batches.
+
+```bash
+bdnb-parquet-compact-publish \
+  --plan-dir /mnt/data/parquet-compaction-plan \
+  --source-root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet \
+  --writable-source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet \
+  --output-root /mnt/data/parquet-compaction-scheduled \
+  --tables-root "territoire-geospatial/cadastre/batiments/base-donnees-nationale/bdnb_2026_02_a_open_data/tables" \
+  --execute \
+  --prune-backup
+```
+
+The native directory must be writable by the invoking user, including the
+BDNB dataset's parent directory. Do not run the Parquet publisher as root.
+The same `--writable-source-root` option is accepted by
+`bdnb-parquet-compact-all`. The published replacement is immediately visible
+through both native and bind-mount paths since the snapshot directory itself
+is not renamed. Original redundant BDNB parts are removed only after staging
+and publication validation. Subsequent global snapshot indexes or torrents
+must be rebuilt.
