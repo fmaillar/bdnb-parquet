@@ -9,6 +9,8 @@ No other corpus datasets are touched.
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import errno
 import json
 import os
@@ -372,6 +374,142 @@ def _manifest_datatourisme(
     if omitted_csv:
         dataset["compaction_omitted_empty_csv"] = omitted_csv
     replace_json(stage / "dataset.json", dataset)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _imope_deduplicated_aliases(
+    original: Path,
+    source_root: Path,
+    catalog: Path | None,
+) -> dict[str, dict[str, Any]]:
+    """Authenticate missing IMoPE paths against the release SHA-256 catalog.
+
+    The release builder removed byte-identical Parquet objects globally;
+    original IMoPE manifest entries describe the pre-deduplication inventory.
+    Never infer aliases from filenames, shapes, or matching byte lengths.
+    """
+    listing = json.loads((original / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(listing, list):
+        raise ValueError("IMoPE manifest must contain a department list")
+    entries: dict[str, dict[str, Any]] = {}
+    manifest_paths: list[str] = []
+    for dept in listing:
+        name = dept["department"]
+        if not isinstance(name, str) or not name or "/" in name or name == "..":
+            raise ValueError(f"Invalid IMoPE department: {name!r}")
+        if not isinstance(dept.get("parquet"), list):
+            raise ValueError(f"Missing IMoPE department Parquet inventory: {name}")
+        for description in dept["parquet"]:
+            fragment = relative_path(description["path"])
+            if len(fragment.parts) != 1 or fragment.suffix != ".parquet":
+                raise ValueError(f"Unsafe IMoPE filename: {fragment}")
+            name_path = (Path(name) / fragment).as_posix()
+            manifest_paths.append(name_path)
+            entries[name_path] = description
+    duplicates = sorted(
+        name for name, count in Counter(manifest_paths).items() if count > 1
+    )
+    physical = {
+        p.relative_to(original).as_posix()
+        for p in original.rglob("*.parquet")
+    }
+    missing = sorted(set(entries) - physical)
+    unlisted = sorted(physical - set(entries))
+    if duplicates or unlisted:
+        raise ValueError(
+            "IMoPE physical/manifest discrepancy: "
+            f"duplicate_references={len(duplicates)} {duplicates[:8]!r}, "
+            f"unlisted_physical={len(unlisted)} {unlisted[:8]!r}"
+        )
+    if not missing:
+        return {}
+    if catalog is None:
+        raise ValueError(
+            f"IMoPE has {len(missing)} deduplicated references requiring "
+            "--duplicates-catalog <release-parquet-plan/_meta/duplicates.tsv>"
+        )
+    if not catalog.is_file() or catalog.is_symlink():
+        raise ValueError(f"Unsafe or missing SHA-256 duplicates catalog: {catalog}")
+
+    prefix = (Path("parquet") / TARGETS["imope"]).as_posix() + "/"
+    found: dict[str, dict[str, Any]] = {}
+    release = source_root.parent
+    sha_cache: dict[Path, str] = {}
+    footer_cache: dict[Path, dict[str, Any]] = {}
+    with catalog.open(encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream, delimiter="\t")
+        required = {"duplicate_path", "canonical_path", "bytes", "sha256"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise ValueError("SHA-256 catalog has missing required columns")
+        for row in reader:
+            duplicate = relative_path(row["duplicate_path"]).as_posix()
+            if not duplicate.startswith(prefix):
+                continue
+            old = duplicate[len(prefix):]
+            if old not in entries:
+                raise ValueError(
+                    f"IMoPE catalog references unlisted original: {old}"
+                )
+            if old in physical:
+                raise ValueError(
+                    f"IMoPE catalog marks an existing file as removed: {old}"
+                )
+            if old in found:
+                raise ValueError(f"IMoPE duplicate catalog has repeated entry: {old}")
+            canonical = relative_path(row["canonical_path"])
+            if not canonical.as_posix().startswith(prefix):
+                # Canonical may live in another dataset; this publisher swaps
+                # five datasets independently, so external paths must first
+                # be audited and represented explicitly rather than guessed.
+                raise ValueError(
+                    f"IMoPE alias canonical outside IMoPE dataset: "
+                    f"{old} -> {canonical}"
+                )
+            relative_canon = Path(canonical.as_posix()[len(prefix):])
+            path = release / canonical
+            if (not path.is_file() or path.is_symlink()
+                or path.stat().st_size != int(row["bytes"])):
+                raise ValueError(
+                    f"Missing/changed canonical file for IMoPE alias: {old} -> {path}"
+                )
+            if row["sha256"] != sha_cache.setdefault(path, _sha256(path)):
+                raise ValueError(f"IMoPE canonical SHA-256 mismatch: {old}")
+            if path not in footer_cache:
+                footer_cache[path] = validate_parquet(path)
+            footer = footer_cache[path]
+            original_entry = entries[old]
+            for field in ("bytes", "rows", "row_groups", "columns", "geo"):
+                if original_entry[field] != footer[field]:
+                    raise ValueError(
+                        f"IMoPE alias {field} mismatch: {old} -> {canonical}"
+                    )
+            found[old] = {
+                "original": old,
+                "canonical": relative_canon.as_posix(),
+                "sha256": row["sha256"],
+                "original_metadata": dict(original_entry),
+                "reason": "global-release-sha256-deduplication",
+            }
+    missing_catalog = sorted(set(missing) - set(found))
+    if missing_catalog:
+        raise ValueError(
+            f"IMoPE {len(missing_catalog)} manifest-only references lack "
+            f"verified catalog mappings: {missing_catalog[:12]!r}"
+        )
+    print(
+        f"INFO: IMoPE {len(found)} manifest-only source aliases verified "
+        f"against {len(sha_cache)} distinct SHA-256 canonical files; "
+        "physical files will not be recreated",
+        file=sys.stderr, flush=True,
+    )
+    return found
 
 
 def _manifest_imope(stage: Path, original: Path) -> None:
