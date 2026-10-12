@@ -464,22 +464,25 @@ def _imope_deduplicated_aliases(
             if old in found:
                 raise ValueError(f"IMoPE duplicate catalog has repeated entry: {old}")
             canonical = relative_path(row["canonical_path"])
-            if not canonical.as_posix().startswith(prefix):
-                # Canonical may live in another dataset; this publisher swaps
-                # five datasets independently, so external paths must first
-                # be audited and represented explicitly rather than guessed.
+            if not canonical.parts or canonical.parts[0] != "parquet":
                 raise ValueError(
-                    f"IMoPE alias canonical outside IMoPE dataset: "
+                    f"IMoPE canonical path is outside Parquet release: "
                     f"{old} -> {canonical}"
                 )
-            relative_canon = Path(canonical.as_posix()[len(prefix):])
+            internal = canonical.as_posix().startswith(prefix)
+            relative_canon = (
+                Path(canonical.as_posix()[len(prefix):])
+                if internal else canonical
+            )
             path = release / canonical
             if (not path.is_file() or path.is_symlink()
                 or path.stat().st_size != int(row["bytes"])):
                 raise ValueError(
                     f"Missing/changed canonical file for IMoPE alias: {old} -> {path}"
                 )
-            if row["sha256"] != sha_cache.setdefault(path, _sha256(path)):
+            if path not in sha_cache:
+                sha_cache[path] = _sha256(path)
+            if row["sha256"] != sha_cache[path]:
                 raise ValueError(f"IMoPE canonical SHA-256 mismatch: {old}")
             if path not in footer_cache:
                 footer_cache[path] = validate_parquet(path)
@@ -493,6 +496,8 @@ def _imope_deduplicated_aliases(
             found[old] = {
                 "original": old,
                 "canonical": relative_canon.as_posix(),
+                "canonical_release_path": canonical.as_posix(),
+                "scope": "imope" if internal else "release",
                 "sha256": row["sha256"],
                 "original_metadata": dict(original_entry),
                 "reason": "global-release-sha256-deduplication",
@@ -517,6 +522,7 @@ def _manifest_imope(
     original: Path,
     source_mapping: dict[str, tuple[str, int, int]],
     dedup_aliases: dict[str, dict[str, Any]],
+    release_root: Path,
 ) -> list[dict[str, Any]]:
     """Rebuild *physical* files while preserving exact original dedup aliases.
 
@@ -561,13 +567,21 @@ def _manifest_imope(
             if Path(old).parent != Path(name):
                 continue
             original_canon = alias["canonical"]
-            published, offset, rows = source_mapping.get(
-                original_canon,
-                (original_canon, 0, int(alias["original_metadata"]["rows"])),
-            )
+            if alias["scope"] == "imope":
+                published, offset, rows = source_mapping.get(
+                    original_canon,
+                    (original_canon, 0, int(alias["original_metadata"]["rows"])),
+                )
+                target = stage / published
+                published_scope = "imope"
+            else:
+                published = alias["canonical_release_path"]
+                offset = 0
+                rows = int(alias["original_metadata"]["rows"])
+                target = release_root / published
+                published_scope = "release"
             if rows != int(alias["original_metadata"]["rows"]):
                 raise ValueError(f"IMoPE canonical source rows changed: {old}")
-            target = stage / published
             if (not target.is_file()
                 or target.is_symlink()
                 or pq.read_metadata(target).num_rows < offset + rows):
@@ -578,6 +592,7 @@ def _manifest_imope(
             record = {
                 **alias,
                 "published": published,
+                "published_scope": published_scope,
                 "first_row": offset,
                 "rows": rows,
             }
@@ -815,7 +830,7 @@ def _build_stage(
         _manifest_datatourisme(stage, original, mapping)
     elif key == "imope":
         imope_resolved_aliases = _manifest_imope(
-            stage, original, mapping, imope_aliases,
+            stage, original, mapping, imope_aliases, source_root.parent,
         )
     elif key == "vigieau":
         _manifest_vigieau(stage, original, mapping)
@@ -925,6 +940,20 @@ def publish(
         duplicates_catalog.expanduser().resolve()
         if duplicates_catalog is not None else None,
     )
+    selected_files = {
+        source.relative
+        for _key, selection, _category in selected
+        for source in selection.sources
+    }
+    for alias in imope_aliases.values():
+        if (alias["scope"] == "release"
+            and alias["canonical_release_path"].removeprefix("parquet/")
+            in selected_files):
+            raise ValueError(
+                "IMoPE external canonical is itself scheduled for compaction; "
+                f"manual remapping is required: {alias['original']} -> "
+                f"{alias['canonical_release_path']}"
+            )
     for key, directory in paths.items():
         if not directory.is_dir() or directory.is_symlink():
             raise ValueError(f"Missing or unsafe dataset: {directory}")
