@@ -775,6 +775,33 @@ def _validate_stage(
     }
 
 
+def _validate_imope_published_aliases(
+    dataset: Path, release_root: Path,
+) -> None:
+    """Check every logical alias resolves after dataset directory swaps."""
+    index = json.loads((dataset / "_COMPACTION_SOURCES.json").read_text())
+    aliases = index.get("deduplicated_aliases", [])
+    if not isinstance(aliases, list):
+        raise ValueError("IMoPE published alias index missing")
+    for entry in aliases:
+        rel = relative_path(entry["published"])
+        if entry["published_scope"] == "imope":
+            dest = dataset / rel
+        elif entry["published_scope"] == "release":
+            if rel.parts[0] != "parquet":
+                raise ValueError("Unsafe release-wide alias reference")
+            dest = release_root / rel
+        else:
+            raise ValueError("Unknown IMoPE alias scope")
+        if (not dest.is_file() or dest.is_symlink()
+            or entry["first_row"] < 0 or entry["rows"] < 0
+            or pq.read_metadata(dest).num_rows
+               < entry["first_row"] + entry["rows"]):
+            raise ValueError(
+                f"IMoPE published alias unresolved: {entry['original']}"
+            )
+
+
 def _restore_directory_modes(stage: Path, original: Path) -> None:
     """Restore the snapshot's directory protections after stage construction.
 
@@ -1026,6 +1053,10 @@ def publish(
                     )["sources"]
                 },
             )
+            if key == "imope":
+                _validate_imope_published_aliases(
+                    directory, publish_root.parent,
+                )
             print(f"PUBLISHED {key}", flush=True)
     except BaseException:
         # If a regular exception occurs during the multi-directory swap,
