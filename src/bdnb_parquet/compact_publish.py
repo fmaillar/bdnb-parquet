@@ -9,6 +9,7 @@ only after the swap succeeds and the new tree is validated.
 from __future__ import annotations
 
 import argparse
+import errno
 import csv
 import json
 import os
@@ -363,6 +364,23 @@ def validate_published_dataset(dataset: Path, report: dict[str, Any]) -> None:
         raise ValueError("Published manifest count mismatch")
 
 
+def require_writable_publication_parent(dataset: Path) -> None:
+    """Fail fast if the source dataset or its parent is on a read-only mount.
+
+    The replacement staging directory and backup must be created alongside
+    the original BDNB directory; a read-only mount cannot be pruned.
+    """
+    for path in (dataset.parent, dataset):
+        flags = os.statvfs(path).f_flag
+        if flags & os.ST_RDONLY:
+            raise OSError(
+                errno.EROFS,
+                "BDNB publication requires a writable mount; "
+                "inspect findmnt -T for this path before retrying",
+                str(path),
+            )
+
+
 def publish(
     source_root: Path, plan_dir: Path, compact_root: Path,
     tables_relative: str, *, prune_backup: bool,
@@ -383,6 +401,7 @@ def publish(
         )
     if stage.is_symlink():
         raise ValueError("Staging path may not be a symbolic link")
+    require_writable_publication_parent(dataset)
     started = time.perf_counter()
     report = stage_dataset(
         source_root=root, plan_dir=plan_dir,
