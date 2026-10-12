@@ -481,15 +481,22 @@ outside the BDNB dataset must be regenerated after publication.
 A snapshot mounted as
 `/mnt/data/torrents/download/france-open-data-parquet-2026-10-10`
 from `/mnt/data/datasets/france-open-data-parquet-2026-10-10`
-has a **different mount ID** from the writable `/mnt/data` root.
-Linux returns EXDEV for hardlinks across the bind mount even if the
-underlying ext4 filesystem is identical.
+may have a **different mount ID** from the writable `/mnt/data` root.
+Linux returns EXDEV for hardlinks across separate mount IDs even if the
+underlying ext4 filesystem is identical. The physical /mnt/data/datasets
+path can itself still traverse a separate mount, so using it alone does
+not guarantee that hardlinks will work.
 
 For the final **publication-only** run, use the native physical mount alias.
 The planner stays anchored to its original --source-root and the tool requires
 both source roots to identify the same physical directory (same inode). It
 probes both the ability to create a staging directory and a real cross-path
-hardlink **before** verifying any of the candidate batches.
+hardlink **before** verifying any of the candidate batches. If the cross-path
+link fails with EXDEV, the publisher falls back to staging copies; it verifies
+each copied file's byte length and SHA-256 checksum before promotion.
+The preflight reserves the estimated total size of compacted Parquet outputs
+plus `--min-free-gib` (default 2 GiB) for the worst-case copy requirement.
+This is a *space estimate*, not a filesystem quota.
 
 ```bash
 bdnb-parquet-compact-publish \
@@ -505,7 +512,8 @@ bdnb-parquet-compact-publish \
 The native directory must be writable by the invoking user, including the
 BDNB dataset's parent directory. Do not run the Parquet publisher as root.
 The same `--writable-source-root` option is accepted by
-`bdnb-parquet-compact-all`. The published replacement is immediately visible
+`bdnb-parquet-compact-all`. The command emits an `INFO` message when
+the byte-copy fallback is activated. The published replacement is immediately visible
 through both native and bind-mount paths since the snapshot directory itself
 is not renamed. Original redundant BDNB parts are removed only after staging
 and publication validation. Subsequent global snapshot indexes or torrents
