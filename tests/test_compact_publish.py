@@ -165,19 +165,63 @@ class PublishCompactionTests(unittest.TestCase):
         self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 4)
         self.assertFalse(self.dataset.with_name("bdnb.compaction-stage").exists())
 
-    def test_cross_mount_link_failure_detected_before_long_verification(self):
+    def test_cross_mount_copy_fallback_publishes_and_prunes(self):
+        self.compact()
+        original = (
+            self.tables / "singleton" / "part-00000.parquet"
+        ).read_bytes()
+        with patch(
+            "bdnb_parquet.compact_publish.os.link",
+            side_effect=OSError(errno.EXDEV, "Invalid cross-device link"),
+        ):
+            result = publish(**self.kwargs(), prune_backup=True)
+        self.assertTrue(result["pruned"])
+        self.assertEqual(result["verified_batches"], 1)
+        self.assertEqual(result["verified_rows"], 20)
+        self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 2)
+        self.assertEqual(
+            (self.tables / "singleton" / "part-00000.parquet").read_bytes(),
+            original,
+        )
+        self.assertFalse(self.dataset.with_name("bdnb.precompact-backup").exists())
+
+    def test_cross_mount_copy_fallback_refuses_insufficient_disk(self):
         self.compact()
         with patch(
             "bdnb_parquet.compact_publish.os.link",
             side_effect=OSError(errno.EXDEV, "Invalid cross-device link"),
         ), patch(
+            "bdnb_parquet.compact_publish.shutil.disk_usage",
+            return_value=SimpleNamespace(free=0),
+        ), patch(
             "bdnb_parquet.compact_publish.verify",
             side_effect=AssertionError("Long verification should not begin"),
         ):
-            with self.assertRaisesRegex(OSError, "writable-source-root"):
+            with self.assertRaises(OSError) as caught:
                 publish(**self.kwargs(), prune_backup=True)
+        self.assertEqual(caught.exception.errno, errno.ENOSPC)
         self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 4)
         self.assertFalse(self.dataset.with_name("bdnb.compaction-stage").exists())
+
+    def test_cross_mount_copied_file_checksum_mismatch_fails_closed(self):
+        self.compact()
+
+        def corrupt_copy(reader, writer, *, length):
+            payload = reader.read()
+            writer.write(b"X" * len(payload))
+
+        with patch(
+            "bdnb_parquet.compact_publish.os.link",
+            side_effect=OSError(errno.EXDEV, "Invalid cross-device link"),
+        ), patch(
+            "bdnb_parquet.compact_publish.shutil.copyfileobj",
+            side_effect=corrupt_copy,
+        ):
+            with self.assertRaisesRegex(IOError, "checksum differs"):
+                publish(**self.kwargs(), prune_backup=True)
+        self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 4)
+        self.assertFalse(self.dataset.with_name("bdnb.precompact-backup").exists())
+
 
     def test_missing_compacted_output_does_not_touch_original(self):
         old_files = list(self.tables.rglob("*.parquet"))
