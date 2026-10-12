@@ -568,3 +568,128 @@ from these staged results**. A dataset-specific publisher must update
 filename-based source references and validate source partition semantics
 before pruning them. The global snapshot/torrent manifest must be
 regenerated after all datasets have been safely published.
+
+## Five datasets: controlled publication and original cleanup
+
+The separate `bdnb-parquet-compact-five-publish` command consumes the 497
+fully verified staged batches. It never recompresses Parquet data. It
+publishes *exactly* WALDEC, DataTourisme, IMoPE, RNA import and Vigieau.
+
+### Preflight without changes (always run first)
+
+```bash
+bdnb-parquet-compact-five-publish \
+  --plan-dir /mnt/data/parquet-compaction-plan \
+  --source-root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet \
+  --writable-source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet \
+  --output-root /mnt/data/parquet-compaction-other5 \
+  --duplicates-catalog /mnt/data/datasets/release-parquet-plan/_meta/duplicates.tsv
+```
+
+IMoPE has 187 SHA-256 deduplicated logical source paths absent from
+the physical release. Use the original `duplicates.tsv` catalog to prove
+the byte-identical canonical source for **every** missing path. Preflight
+verifies exact duplicate/canonical paths, original byte counts, real
+canonical SHA-256, row count, row groups, columns and GeoParquet status;
+no missing entry may be guessed from filename or schema. Canonicals
+outside IMoPE remain release-scoped logical references if their physical
+paths stay unchanged; cross-dataset canonical files themselves scheduled
+for compaction are refused for manual audit. If an internal canonical
+file is compacted, its alias resolves to the new physical file and
+exact row range. Published metadata separates physical
+`rows` from `original_logical_rows` and preserves all aliases in
+`deduplicated_aliases` without recreating physical duplicates.
+
+Vigieau's legacy converter manifest has **4,721 records**, but the release
+contains **2,338 physical Parquet files**. The release-generation pipeline
+moved 2,322 surviving GeoJSON files from archive-named folders to
+`geojson/YYYY`, left 16 paths unchanged, and deduplicated 2,383
+additional logical records by SHA-256. Preflight now checks **every**
+original record against one of these three mechanisms and refuses any
+unlisted physical files, duplicate original paths, unresolvable canonicals,
+size differences, Parquet row mismatches, or SHA-256 mismatches. The
+published `dataset.json` distinguishes the physical **1,330,462**
+rows from the legacy **1,571,878** logical rows, including **241,416**
+rows represented by aliases. Every alias retains its original name,
+canonical SHA-256, release path, and final published physical row range
+under `_COMPACTION_SOURCES.json`; the new manifest lists physical files
+only. No duplicate Parquet files are recreated.
+
+The preflight checks the old plan against the actual dataset file counts,
+inspects converter manifests and rejects missing, changed or unrecognized
+source references (including unexpectedly stale JSON sidecars). A narrow
+DataTourisme exception accepts an absent CSV Parquet output only when its
+legacy manifest entry declares **exactly zero rows and zero row groups**,
+and no physical CSV output is unlisted. The staged manifest omits that
+nonexistent output, records its full original entry under
+`compaction_omitted_empty_csv`, and recalculates file counts and byte
+sizes; the original manifest remains unchanged until the final directory
+swap. Any nonempty missing source or ambiguous manifest still blocks
+publication. If a
+dataset has been normalized, the Vigieau converter's known
+`geojson/<archive-year>/...` to `geojson/YYYY/...` move is reconciled
+using the exact rule in `normalize_vigieau.py`; no fuzzy matching.
+
+### Explicit publication
+
+Only after the preflight succeeds, stop the old Transmission torrent and
+grant the invoking user write permission on the four **direct parent**
+directories of these datasets on the *native writable mount*. Then run:
+
+```bash
+bdnb-parquet-compact-five-publish \
+  --plan-dir /mnt/data/parquet-compaction-plan \
+  --source-root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet \
+  --writable-source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet \
+  --output-root /mnt/data/parquet-compaction-other5 \
+  --duplicates-catalog /mnt/data/datasets/release-parquet-plan/_meta/duplicates.tsv \
+  --workers 4 --threads 2 \
+  --execute
+```
+
+The verification phase can reuse the proven **4 worker processes × 2
+Arrow threads** configuration via `--workers 4 --threads 2`.
+The worker pool performs only read-only output-audit and complete
+ordered Arrow equality checks. At most four batches are in flight;
+if any fails, no staging or directory swaps take place. The source
+tree staging, manifest rewrites, five directory swaps and rollback
+remain sequential. On a mechanical HDD this configuration is not
+guaranteed faster than fewer workers; measure actual progress.
+
+Keep `--prune-backup` **off for the first real publication** so the five
+`.precompact-backup` directories are preserved until post-publication
+verification. `--workers` is limited to 1–4; `--threads` must be
+positive. Dry-run remains read-only and does not run bulk Arrow
+comparisons.
+
+The publisher verifies all 497 compressed outputs against every original
+Arrow value and schema, stages **all five** dataset replacement trees with
+verified hardlinks or SHA-256-checked cross-mount copies, rebuilds the
+native DataTourisme NTriples `_SUCCESS.json` and numbered part files,
+DataTourisme CSV mappings, IMoPE departmental inventories, and Vigieau
+source records, and writes `_COMPACTION_SOURCES.json` per dataset.
+The index maps every obsolete original filename to its new physical
+Parquet path, zero-based `first_row` offset and `rows` length. The
+original identity and date are preserved in that mapping rather than
+as a one-file-per-date physical layout.
+
+After stage validation, the publisher swaps all five directories while
+retaining `.precompact-backup` originals. Ordinary swap exceptions trigger
+rollback of already-swapped datasets. Only after all five new datasets
+pass validation are the backups pruned when `--prune-backup` was given.
+A power outage/SIGKILL mid-swap can still require manual inspection;
+the tool refuses pre-existing stages or backups. A failure during backup
+pruning also requires inspection; new published data already passed
+validation. There is no filesystem-wide atomic transaction spanning five
+independent directory names.
+
+Peak staging headroom is conservatively budgeted from all source and
+compacted file sizes plus `--min-free-gib` (default 20). Leave the old
+snapshot's bind-mount protections in place; the physical native alias
+is used for directory renames. Do not run as root.
+
+**The global corpus manifest, checksums, and torrent metadata are NOT
+regenerated by this publisher**. They must be rebuilt after publication
+before seeding the new torrent. Do not delete the 74 GiB compaction output
+work directory until the entire corpus and source mappings have been
+audited.
