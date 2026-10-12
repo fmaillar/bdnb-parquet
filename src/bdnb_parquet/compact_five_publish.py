@@ -655,79 +655,326 @@ def _manifest_imope(
     return resolved_aliases
 
 
-def _vigieau_current_output(dataset_root: Path, stored: str) -> str:
-    """Resolve only the known, deterministic Vigieau year-normalization move.
-
-    normalize_vigieau.py relocated archive-named directories to geojson/YYYY
-    without rewriting manifest.json. Never fall back to fuzzy filenames.
-    """
-    rel = Path(stored)
-    if rel.is_absolute() or ".." in rel.parts or not rel.parts:
-        raise ValueError(f"Unsafe Vigieau path in manifest: {stored}")
-    if (dataset_root / rel).is_file():
-        return rel.as_posix()
+def _vigieau_normalize_legacy_path(stored: str) -> str:
+    """Apply exactly normalize_vigieau.py's known archive-year move."""
+    rel = relative_path(stored)
     if len(rel.parts) >= 3 and rel.parts[0] == "geojson":
         match = YEAR_DIR_RE.fullmatch(rel.parts[1])
         if match:
-            normalized = Path("geojson") / match.group(1) / Path(*rel.parts[2:])
-            if (dataset_root / normalized).is_file():
-                return normalized.as_posix()
+            return (
+                Path("geojson") / match.group(1) / Path(*rel.parts[2:])
+            ).as_posix()
+    return rel.as_posix()
+
+
+def _vigieau_current_output(dataset_root: Path, stored: str) -> str:
+    """Resolve an *existing* file after the known normalization step."""
+    original = relative_path(stored).as_posix()
+    if (dataset_root / original).is_file():
+        return original
+    normalized = _vigieau_normalize_legacy_path(stored)
+    if (dataset_root / normalized).is_file():
+        return normalized
     raise ValueError(f"Unresolved Vigieau manifest path: {stored}")
+
+
+def _vigieau_reconciled_inventory(
+    original: Path, source_root: Path, catalog: Path | None,
+) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    """Reconcile the COMPLETE Vigieau manifest with physical files.
+
+    The original archive-directory names were normalized by year, then the
+    release builder deleted global SHA-256 duplicates. An absent manifest
+    path is accepted only with an exact catalog record, matching file size,
+    real SHA-256, rows, and GeoParquet status. No guessed associations.
+    """
+    listing = json.loads((original / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(listing, list):
+        raise ValueError("Unexpected Vigieau manifest layout")
+    entries: dict[str, dict[str, Any]] = {}
+    for item in listing:
+        if not isinstance(item, dict):
+            raise ValueError("Invalid Vigieau manifest entry")
+        old = relative_path(item["output"]).as_posix()
+        if old in entries:
+            raise ValueError(f"Duplicate Vigieau manifest output: {old}")
+        entries[old] = item
+
+    physical = {
+        p.relative_to(original).as_posix()
+        for p in original.rglob("*.parquet")
+    }
+    retained: dict[str, str] = {}
+    covered: dict[str, str] = {}
+    missing: dict[str, dict[str, Any]] = {}
+    for old, entry in entries.items():
+        normalized = _vigieau_normalize_legacy_path(old)
+        path = old if old in physical else normalized
+        if path in physical:
+            if path in covered:
+                raise ValueError(
+                    f"Two Vigieau source entries share one physical Parquet: "
+                    f"{covered[path]} and {old} -> {path}"
+                )
+            candidate = original / path
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ValueError(f"Unsafe Vigieau physical Parquet: {candidate}")
+            if candidate.stat().st_size != int(entry["bytes"]):
+                raise ValueError(f"Vigieau physical file size changed: {old}")
+            footer = pq.read_metadata(candidate)
+            if footer.num_rows != int(entry["rows"]):
+                raise ValueError(f"Vigieau physical rows changed: {old}")
+            retained[old] = path
+            covered[path] = old
+        else:
+            missing[old] = entry
+
+    unlisted = sorted(physical - set(covered))
+    if unlisted:
+        raise ValueError(
+            f"Vigieau has {len(unlisted)} physical Parquet files absent "
+            f"from normalized legacy manifest: {unlisted[:12]!r}"
+        )
+    if not missing:
+        if int(json.loads((original / "dataset.json").read_text())["rows"]) != sum(
+            int(item["rows"]) for item in entries.values()
+        ):
+            raise ValueError("Vigieau legacy dataset row total mismatch")
+        return retained, {}
+
+    if catalog is None:
+        raise ValueError(
+            f"Vigieau has {len(missing)} deduplicated logical sources: "
+            "pass --duplicates-catalog"
+        )
+    if not catalog.is_file() or catalog.is_symlink():
+        raise ValueError(f"Unsafe or missing Vigieau SHA-256 catalog: {catalog}")
+
+    prefix = (Path("parquet") / TARGETS["vigieau"]).as_posix() + "/"
+    release_root = source_root.parent
+    aliases: dict[str, dict[str, Any]] = {}
+    hashes: dict[Path, str] = {}
+    footers: dict[Path, tuple[int, bool]] = {}
+    with catalog.open(encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream, delimiter="\t")
+        required = {"duplicate_path", "canonical_path", "bytes", "sha256"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise ValueError("Vigieau SHA-256 catalog missing required columns")
+        for row in reader:
+            duplicate = _catalog_release_parquet_path(
+                row["duplicate_path"],
+            ).as_posix()
+            if not duplicate.startswith(prefix):
+                continue
+            old = duplicate[len(prefix):]
+            if old not in missing:
+                raise ValueError(
+                    "Vigieau catalog references an existing or unknown "
+                    f"source: {old}"
+                )
+            if old in aliases:
+                raise ValueError(f"Repeated Vigieau duplicate catalog entry: {old}")
+            canonical = _catalog_release_parquet_path(
+                row["canonical_path"],
+            )
+            internal = canonical.as_posix().startswith(prefix)
+            if internal:
+                canon_old = canonical.as_posix()[len(prefix):]
+                canon_physical = _vigieau_normalize_legacy_path(canon_old)
+                if canon_old in physical:
+                    canon_physical = canon_old
+                # Catalog canonicals must be represented by a retained
+                # manifest entry after the deterministic directory move.
+                if canon_physical not in covered:
+                    raise ValueError(
+                        f"Vigieau canonical lacks a retained file: "
+                        f"{old} -> {canonical}"
+                    )
+                published_canonical = canon_physical
+                path = original / canon_physical
+            else:
+                published_canonical = canonical.as_posix()
+                path = release_root / canonical
+            if (path.is_symlink() or not path.is_file()
+                or path.stat().st_size != int(row["bytes"])
+                or int(row["bytes"]) != int(missing[old]["bytes"])):
+                raise ValueError(
+                    f"Vigieau alias has missing/changed canonical bytes: "
+                    f"{old} -> {canonical}"
+                )
+            if path not in hashes:
+                hashes[path] = _sha256(path)
+            if hashes[path] != row["sha256"]:
+                raise ValueError(
+                    f"Vigieau canonical SHA-256 mismatch: {old} -> {canonical}"
+                )
+            if path not in footers:
+                meta = pq.read_metadata(path)
+                schema = pq.read_schema(path)
+                footers[path] = (
+                    meta.num_rows, b"geo" in (schema.metadata or {}),
+                )
+            rows, geo = footers[path]
+            if rows != int(missing[old]["rows"]) or geo != bool(missing[old]["geo"]):
+                raise ValueError(
+                    f"Vigieau canonical content metadata mismatch: {old}"
+                )
+            aliases[old] = {
+                "original": old,
+                "original_metadata": dict(missing[old]),
+                "canonical": published_canonical,
+                "canonical_release_path": (
+                    (Path("parquet") / TARGETS["vigieau"] / published_canonical)
+                    .as_posix() if internal else canonical.as_posix()
+                ),
+                "catalog_canonical": canonical.as_posix(),
+                "scope": "vigieau" if internal else "release",
+                "sha256": row["sha256"],
+                "reason": "global-release-sha256-deduplication",
+            }
+
+    unresolved = sorted(set(missing) - set(aliases))
+    if unresolved:
+        raise ValueError(
+            f"Vigieau has {len(unresolved)} manifest-only paths missing "
+            f"from authenticated SHA-256 catalog: {unresolved[:12]!r}"
+        )
+    source_total = sum(int(item["rows"]) for item in entries.values())
+    data = json.loads((original / "dataset.json").read_text(encoding="utf-8"))
+    if int(data["rows"]) != source_total:
+        raise ValueError("Vigieau source dataset logical row count mismatch")
+    retained_rows = sum(int(entries[old]["rows"]) for old in retained)
+    aliased_rows = sum(int(entries[old]["rows"]) for old in aliases)
+    if retained_rows + aliased_rows != source_total:
+        raise ValueError("Vigieau physical + deduplicated rows disagree")
+
+    print(
+        f"INFO: Vigieau {len(entries)} manifest entries reconciled: "
+        f"{len(retained)} physical ({sum(old != new for old, new in retained.items())} "
+        f"normalized), {len(aliases)} SHA-256 verified aliases across "
+        f"{len(hashes)} canonical files; {source_total} logical rows, "
+        f"{retained_rows} physical rows",
+        file=sys.stderr, flush=True,
+    )
+    return retained, aliases
 
 
 def _manifest_vigieau(
     stage: Path, original: Path,
     old_to_stage: dict[str, tuple[str, int, int]],
-) -> None:
+    retained: dict[str, str],
+    aliases: dict[str, dict[str, Any]],
+    release_root: Path,
+) -> list[dict[str, Any]]:
+    """Publish physical Vigieau files with exact source and alias provenance."""
     listing = json.loads((original / "manifest.json").read_text(encoding="utf-8"))
     if not isinstance(listing, list):
         raise ValueError("Unexpected Vigieau manifest layout")
+
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for entry in listing:
         legacy = entry["output"]
-        old = _vigieau_current_output(original, legacy)
-        rel, offset, num_rows = old_to_stage.get(
+        if legacy not in retained:
+            continue
+        old = retained[legacy]
+        published, offset, count = old_to_stage.get(
             old, (old, 0, int(entry["rows"])),
         )
-        if num_rows != int(entry["rows"]):
-            raise ValueError(f"Vigieau source rows changed: {old}")
-        grouped[rel].append({
-            **entry, "original_output": old,
+        if count != int(entry["rows"]):
+            raise ValueError(f"Vigieau physical rows changed: {legacy}")
+        grouped[published].append({
+            **entry,
+            "original_output": old,
             "legacy_output": legacy,
-            "row_offset": offset, "row_count": num_rows,
+            "row_offset": offset, "row_count": count,
         })
+
+    resolved: list[dict[str, Any]] = []
+    for old, alias in sorted(aliases.items()):
+        if alias["scope"] == "vigieau":
+            published, offset, rows = old_to_stage.get(
+                alias["canonical"],
+                (alias["canonical"], 0, int(alias["original_metadata"]["rows"])),
+            )
+            path = stage / published
+            scope = "vigieau"
+        else:
+            published = alias["canonical_release_path"]
+            offset = 0
+            rows = int(alias["original_metadata"]["rows"])
+            path = release_root / published
+            scope = "release"
+        if (rows != int(alias["original_metadata"]["rows"])
+            or not path.is_file() or path.is_symlink()
+            or pq.read_metadata(path).num_rows < offset + rows):
+            raise ValueError(
+                f"Vigieau compacted canonical alias unresolved: "
+                f"{old} -> {published}"
+            )
+        resolved.append({
+            **alias,
+            "published": published,
+            "published_scope": scope,
+            "first_row": offset,
+            "rows": rows,
+        })
+
     updated = []
     for rel, records in sorted(grouped.items()):
         path = stage / rel
-        if not path.is_file():
+        if not path.is_file() or path.is_symlink():
             raise ValueError(f"Missing Vigieau staged Parquet: {rel}")
         metadata = pq.read_metadata(path)
-        expected = sum(int(x["row_count"]) for x in records)
-        if expected != metadata.num_rows:
-            raise ValueError(f"Vigieau manifest rows disagree: {rel}")
-        base = dict(records[0])
+        ordered = sorted(records, key=lambda item: item["row_offset"])
+        expected = sum(int(x["row_count"]) for x in ordered)
+        if (expected != metadata.num_rows
+            or [(int(x["row_offset"]), int(x["row_count"])) for x in ordered]
+            != _contiguous_ranges(ordered)):
+            raise ValueError(f"Vigieau physical manifest row ranges disagree: {rel}")
+        base = dict(ordered[0])
         base.update({
             "output": rel,
             "rows": expected,
             "bytes": path.stat().st_size,
-            "original_sources": records,
-            "compacted": len(records) > 1,
+            "original_sources": ordered,
+            "compacted": len(ordered) > 1,
         })
         updated.append(base)
-    original_total_rows = sum(int(x["rows"]) for x in listing)
-    if original_total_rows != sum(int(x["rows"]) for x in updated):
-        raise ValueError("Vigieau total rows changed")
+
+    original_total = sum(int(x["rows"]) for x in listing)
+    physical_total = sum(int(x["rows"]) for x in updated)
+    alias_total = sum(int(x["rows"]) for x in resolved)
+    if original_total != physical_total + alias_total:
+        raise ValueError(
+            "Vigieau logical rows changed: "
+            f"{original_total} != {physical_total} + {alias_total}"
+        )
     dataset = json.loads((original / "dataset.json").read_text(encoding="utf-8"))
-    if int(dataset["rows"]) != original_total_rows:
-        raise ValueError("Vigieau source dataset rows changed")
+    if int(dataset["rows"]) != original_total:
+        raise ValueError("Vigieau original dataset row total changed")
     dataset.update({
         "parquet_files": len(updated),
-        "rows": original_total_rows,
+        "rows": physical_total,
         "bytes": sum(x["bytes"] for x in updated),
         "geo_files": sum(bool(x.get("geo")) for x in updated),
+        "original_manifest_files": len(listing),
+        "original_logical_rows": original_total,
+        "deduplicated_alias_files": len(resolved),
+        "deduplicated_alias_rows": alias_total,
+        "deduplicated_alias_index": "_COMPACTION_SOURCES.json",
     })
     replace_json(stage / "manifest.json", updated)
     replace_json(stage / "dataset.json", dataset)
+    return resolved
+
+
+def _contiguous_ranges(records: list[dict[str, Any]]) -> list[tuple[int, int]]:
+    total = 0
+    spans = []
+    for record in records:
+        spans.append((total, int(record["row_count"])))
+        total += int(record["row_count"])
+    return spans
 
 
 def _validate_original_metadata(
