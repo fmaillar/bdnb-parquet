@@ -1,5 +1,7 @@
 """Five-dataset publication integration tests using converter-shaped manifests."""
 
+import csv
+import hashlib
 import json
 import os
 import tempfile
@@ -23,7 +25,7 @@ class FiveDatasetPublicationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
-        self.root = self.base / "snapshot"
+        self.root = self.base / "parquet"
         self.root.mkdir()
         self.plan = self.base / "plan"
         self.outputs = self.base / "outputs"
@@ -205,6 +207,110 @@ class FiveDatasetPublicationTests(unittest.TestCase):
                 prune_backup=False, execute=False, min_free_gib=0,
             )
         self.assertTrue((imope_dir / "67/unlisted.parquet").is_file())
+
+    def make_imope_dedup_alias(self, *, checksum_override=None):
+        # The original promotion manifest contains a source that the global
+        # SHA-256 release builder removed, retaining just the canonical one.
+        root = self.dirs["imope"]
+        dept = root / "67"
+        original_path = dept / "im-0.parquet"
+        legacy = json.loads((root / "manifest.json").read_text())
+        described = dict(legacy[0]["parquet"][0])
+        described["path"] = "alias.parquet"
+        legacy[0]["parquet"].append(described)
+        legacy[0]["rows"] += described["rows"]
+        legacy[0]["bytes"] += described["bytes"]
+        legacy[0]["files"] += 1
+        self.put_json(root / "manifest.json", legacy)
+        dataset = json.loads((root / "dataset.json").read_text())
+        dataset["rows"] += described["rows"]
+        dataset["bytes"] += described["bytes"]
+        dataset["files"] += 1
+        self.put_json(root / "dataset.json", dataset)
+        sha = hashlib.sha256(original_path.read_bytes()).hexdigest()
+        catalog = self.base / "release-duplicates.tsv"
+        with catalog.open("w", encoding="utf-8", newline="") as out:
+            writer = csv.DictWriter(
+                out,
+                delimiter="\t",
+                fieldnames=[
+                    "sha256", "canonical_path", "duplicate_path",
+                    "bytes", "reason",
+                ],
+            )
+            writer.writeheader()
+            writer.writerow({
+                "sha256": checksum_override or sha,
+                "canonical_path": (
+                    f"parquet/{TARGETS['imope']}/67/im-0.parquet"
+                ),
+                "duplicate_path": (
+                    f"parquet/{TARGETS['imope']}/67/alias.parquet"
+                ),
+                "bytes": described["bytes"], "reason": "exact-duplicate",
+            })
+        return catalog
+
+    def test_imope_sha256_dedup_alias_survives_compaction(self):
+        catalog = self.make_imope_dedup_alias()
+        self.assertEqual(self.run_pub(
+            "--duplicates-catalog", str(catalog),
+        ), 0)
+        result = publish(
+            plan_dir=self.plan, source_root=self.root,
+            output_root=self.outputs, writable_source_root=None,
+            prune_backup=True, execute=True, min_free_gib=0,
+            duplicates_catalog=catalog,
+        )
+        self.assertEqual(result["verified_batches"], 5)
+        dataset = json.loads((self.dirs["imope"] / "dataset.json").read_text())
+        self.assertEqual(dataset["original_logical_rows"], 12)
+        self.assertEqual(dataset["rows"], 8)
+        self.assertEqual(dataset["deduplicated_alias_files"], 1)
+        self.assertEqual(dataset["deduplicated_alias_rows"], 4)
+        self.assertEqual(dataset["files"], 1)
+        self.assertFalse((self.dirs["imope"] / "67/alias.parquet").exists())
+        compaction = json.loads(
+            (self.dirs["imope"] / "_COMPACTION_SOURCES.json").read_text()
+        )
+        aliases = compaction["deduplicated_aliases"]
+        self.assertEqual(len(aliases), 1)
+        alias = aliases[0]
+        self.assertEqual(alias["original"], "67/alias.parquet")
+        self.assertEqual(alias["canonical"], "67/im-0.parquet")
+        self.assertEqual(alias["rows"], 4)
+        self.assertEqual(alias["first_row"], 0)
+        self.assertTrue(alias["published"].startswith("67/compact-"))
+        self.assertEqual(
+            pq.read_metadata(self.dirs["imope"] / alias["published"]).num_rows, 8
+        )
+        departmental = json.loads(
+            (self.dirs["imope"] / "67/_SUCCESS.json").read_text()
+        )
+        self.assertEqual(departmental["original_logical_rows"], 12)
+        self.assertEqual(departmental["rows"], 8)
+        self.assertEqual(departmental["aliased_rows"], 4)
+        self.assertEqual(departmental["deduplicated_aliases"], aliases)
+
+    def test_imope_sha256_alias_requires_explicit_catalog(self):
+        self.make_imope_dedup_alias()
+        self.assertEqual(self.run_pub(), 1)
+        self.assertTrue(
+            (self.dirs["imope"] / "67/im-0.parquet").is_file()
+        )
+
+    def test_imope_sha256_alias_rejects_bad_checksum(self):
+        catalog = self.make_imope_dedup_alias(
+            checksum_override="0" * 64,
+        )
+        self.assertEqual(
+            self.run_pub("--duplicates-catalog", str(catalog)), 1,
+        )
+        self.assertFalse(
+            self.dirs["imope"].with_name(
+                "imope.precompact-backup"
+            ).exists()
+        )
 
     def test_datatourisme_csv_diagnostic_lists_discrepancies(self):
         path = self.dirs["datatourisme"] / "manifest.json"
