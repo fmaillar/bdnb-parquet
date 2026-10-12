@@ -986,13 +986,9 @@ def _validate_original_metadata(
         # unverified alias is silently accepted.
         return
     elif dataset_name == "vigieau":
-        listing = json.loads((original / "manifest.json").read_text())
-        paths = [_vigieau_current_output(original, item["output"])
-                 for item in listing]
-        physical = {p.relative_to(original).as_posix()
-                    for p in original.rglob("*.parquet")}
-        if len(paths) != len(set(paths)) or physical != set(paths):
-            raise ValueError("Vigieau manifest does not match original inputs")
+        # Full release-catalog reconciliation occurs in preflight, before
+        # any staging or source file mutation.
+        return
     elif dataset_name == "datatourisme":
         manifest = json.loads((original / "manifest.json").read_text())
         _present, missing_empty = _datatourisme_csv_inventory(
@@ -1035,6 +1031,33 @@ def _validate_stage(
         "removed_files": candidate_files - compacted_batches,
         "rows": rows, "bytes": sum(p.stat().st_size for p in files),
     }
+
+
+def _validate_vigieau_published_aliases(
+    dataset: Path, release_root: Path,
+) -> None:
+    """Verify all authenticated logical Vigieau aliases after final swap."""
+    index = json.loads((dataset / "_COMPACTION_SOURCES.json").read_text())
+    aliases = index.get("deduplicated_aliases", [])
+    if not isinstance(aliases, list):
+        raise ValueError("Vigieau published alias index missing")
+    for alias in aliases:
+        rel = relative_path(alias["published"])
+        if alias["published_scope"] == "vigieau":
+            target = dataset / rel
+        elif alias["published_scope"] == "release":
+            if rel.parts[0] != "parquet":
+                raise ValueError("Invalid Vigieau release-scope alias path")
+            target = release_root / rel
+        else:
+            raise ValueError("Invalid Vigieau alias scope")
+        if (not target.is_file() or target.is_symlink()
+            or alias["first_row"] < 0 or alias["rows"] < 0
+            or pq.read_metadata(target).num_rows
+            < alias["first_row"] + alias["rows"]):
+            raise ValueError(
+                f"Vigieau published alias is unresolved: {alias['original']}"
+            )
 
 
 def _validate_imope_published_aliases(
@@ -1089,6 +1112,8 @@ def _build_stage(
     selected: list[tuple[str, Any, str]], inventory: dict[str, int],
     audit_provenance: dict[str, Any],
     imope_aliases: dict[str, dict[str, Any]],
+    vigieau_retained: dict[str, str],
+    vigieau_aliases: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     if stage.exists():
         raise RuntimeError(f"Pre-existing stage needs inspection: {stage}")
@@ -1114,6 +1139,7 @@ def _build_stage(
             mapping[relative] = (new_relative, offset, src.rows)
             offset += src.rows
     imope_resolved_aliases: list[dict[str, Any]] = []
+    vigieau_resolved_aliases: list[dict[str, Any]] = []
     if key == "datatourisme":
         _stage_nt_parts(stage, original, mapping)
         _manifest_datatourisme(stage, original, mapping)
@@ -1122,7 +1148,10 @@ def _build_stage(
             stage, original, mapping, imope_aliases, source_root.parent,
         )
     elif key == "vigieau":
-        _manifest_vigieau(stage, original, mapping)
+        vigieau_resolved_aliases = _manifest_vigieau(
+            stage, original, mapping, vigieau_retained,
+            vigieau_aliases, source_root.parent,
+        )
 
     rows = [
         {"original": old, "published": mapped, "first_row": offset,
@@ -1135,7 +1164,9 @@ def _build_stage(
         "planner_sha256": audit_provenance["planner_sha256"],
         "candidate_batches": len(selected),
         "sources": rows,
-        "deduplicated_aliases": imope_resolved_aliases,
+        "deduplicated_aliases": (
+            imope_resolved_aliases + vigieau_resolved_aliases
+        ),
     }
     replace_json(stage / "_COMPACTION_SOURCES.json", index)
     totals = _validate_stage(
@@ -1145,8 +1176,14 @@ def _build_stage(
     )
     summary = {
         "dataset": key, **totals, "verified_batches": len(selected),
-        "deduplicated_aliases": len(imope_resolved_aliases),
-        "deduplicated_alias_rows": sum(int(x["rows"]) for x in imope_resolved_aliases),
+        "deduplicated_aliases": (
+            len(imope_resolved_aliases) + len(vigieau_resolved_aliases)
+        ),
+        "deduplicated_alias_rows": sum(
+            int(x["rows"]) for x in (
+                imope_resolved_aliases + vigieau_resolved_aliases
+            )
+        ),
     }
     replace_json(stage / "_COMPACTION.json", summary)
     _restore_directory_modes(stage, dataset)
@@ -1224,22 +1261,27 @@ def publish(
     # A plan built against the torrent alias must never be treated as an
     # independent release. Resolve canonical SHA256 objects in the physical
     # release root and require exact catalog records for every missing file.
-    imope_aliases = _imope_deduplicated_aliases(
-        paths["imope"], root,
+    catalog = (
         duplicates_catalog.expanduser().resolve()
-        if duplicates_catalog is not None else None,
+        if duplicates_catalog is not None else None
+    )
+    imope_aliases = _imope_deduplicated_aliases(
+        paths["imope"], root, catalog,
+    )
+    vigieau_retained, vigieau_aliases = _vigieau_reconciled_inventory(
+        paths["vigieau"], root, catalog,
     )
     selected_files = {
         source.relative
         for _key, selection, _category in selected
         for source in selection.sources
     }
-    for alias in imope_aliases.values():
+    for alias in list(imope_aliases.values()) + list(vigieau_aliases.values()):
         if (alias["scope"] == "release"
             and alias["canonical_release_path"].removeprefix("parquet/")
             in selected_files):
             raise ValueError(
-                "IMoPE external canonical is itself scheduled for compaction; "
+                "Cross-dataset canonical is itself scheduled for compaction; "
                 f"manual remapping is required: {alias['original']} -> "
                 f"{alias['canonical_release_path']}"
             )
@@ -1269,6 +1311,11 @@ def publish(
         "imope_deduplicated_alias_rows": sum(
             int(x["original_metadata"]["rows"]) for x in imope_aliases.values()
         ),
+        "vigieau_physical_manifest_sources": len(vigieau_retained),
+        "vigieau_deduplicated_aliases_verified": len(vigieau_aliases),
+        "vigieau_deduplicated_alias_rows": sum(
+            int(x["original_metadata"]["rows"]) for x in vigieau_aliases.values()
+        ),
         "originals_untouched": True,
     }
     print(json.dumps(overview, indent=2, ensure_ascii=False), flush=True)
@@ -1287,6 +1334,7 @@ def publish(
             staged[key] = _build_stage(
                 key, directory, stage, root, publish_root, output_root,
                 grouped[key], inventory[key], expected, imope_aliases,
+                vigieau_retained, vigieau_aliases,
             )
             print(f"STAGED {key}: {staged[key]}", flush=True)
 
@@ -1317,6 +1365,10 @@ def publish(
             )
             if key == "imope":
                 _validate_imope_published_aliases(
+                    directory, publish_root.parent,
+                )
+            elif key == "vigieau":
+                _validate_vigieau_published_aliases(
                     directory, publish_root.parent,
                 )
             print(f"PUBLISHED {key}", flush=True)
