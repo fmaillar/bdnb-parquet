@@ -173,6 +173,39 @@ class FiveDatasetPublicationTests(unittest.TestCase):
                 [entry for entry in selected if entry[0] == "waldec"],
             )
 
+    def test_imope_diagnostic_lists_missing_unlisted_and_duplicates(self):
+        imope_dir = self.dirs["imope"]
+        manifest_path = imope_dir / "manifest.json"
+        listing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        listing[0]["parquet"].append(dict(listing[0]["parquet"][0]))
+        listing[0]["parquet"].append({
+            **listing[0]["parquet"][0], "path": "not-present.parquet",
+        })
+        self.put_json(manifest_path, listing)
+        with self.assertRaisesRegex(
+            ValueError,
+            "IMoPE manifest misses or duplicates physical inputs: "
+            ".*missing_on_disk=1.*67/not-present.parquet"
+            ".*duplicate_references=1.*67/im-0.parquet",
+        ):
+            publish(
+                plan_dir=self.plan, source_root=self.root,
+                output_root=self.outputs, writable_source_root=None,
+                prune_backup=False, execute=False, min_free_gib=0,
+            )
+        self.assertTrue((imope_dir / "67/im-0.parquet").is_file())
+
+    def test_imope_unlisted_file_is_not_silently_adopted(self):
+        imope_dir = self.dirs["imope"]
+        self.write_part(imope_dir / "67/unlisted.parquet", "imope", 50)
+        with self.assertRaisesRegex(ValueError, "Source file count changed"):
+            publish(
+                plan_dir=self.plan, source_root=self.root,
+                output_root=self.outputs, writable_source_root=None,
+                prune_backup=False, execute=False, min_free_gib=0,
+            )
+        self.assertTrue((imope_dir / "67/unlisted.parquet").is_file())
+
     def test_datatourisme_csv_diagnostic_lists_discrepancies(self):
         path = self.dirs["datatourisme"] / "manifest.json"
         metadata = json.loads(path.read_text(encoding="utf-8"))
