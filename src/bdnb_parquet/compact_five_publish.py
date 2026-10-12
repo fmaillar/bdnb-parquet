@@ -662,6 +662,20 @@ def publish(
                 os.replace(directory, displaced)
                 os.replace(backup, directory)
                 print(f"RESTORED original {key}; inspect {displaced}", file=sys.stderr)
+        # Stages belong exclusively to this run (their absence was checked
+        # before creating any). Clean incomplete work so an ordinary failure
+        # is retryable without hand-deleting large staged directories.
+        for key, directory in paths.items():
+            stage = directory.with_name(directory.name + ".compaction-stage")
+            if stage.is_dir() and not stage.is_symlink():
+                try:
+                    prune_validated_backup(stage)
+                except OSError as cleanup_error:
+                    print(
+                        f"INCOMPLETE stage needs inspection: {stage}: "
+                        f"{cleanup_error}",
+                        file=sys.stderr,
+                    )
         raise
 
     # Every published dataset has been validated. Prune only now.
