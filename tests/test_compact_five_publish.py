@@ -209,6 +209,7 @@ class FiveDatasetPublicationTests(unittest.TestCase):
 
     def make_imope_dedup_alias(
         self, *, checksum_override=None, canonical=None,
+        relative_to_parquet=False,
     ):
         # The original promotion manifest contains a source that the global
         # SHA-256 release builder removed, retaining just the canonical one.
@@ -243,10 +244,11 @@ class FiveDatasetPublicationTests(unittest.TestCase):
             writer.writerow({
                 "sha256": checksum_override or sha,
                 "canonical_path": original_path.relative_to(
-                    self.base,
+                    self.root if relative_to_parquet else self.base,
                 ).as_posix(),
                 "duplicate_path": (
-                    f"parquet/{TARGETS['imope']}/67/alias.parquet"
+                    f"{'' if relative_to_parquet else 'parquet/'}"
+                    f"{TARGETS['imope']}/67/alias.parquet"
                 ),
                 "bytes": described["bytes"], "reason": "exact-duplicate",
             })
@@ -292,6 +294,61 @@ class FiveDatasetPublicationTests(unittest.TestCase):
         self.assertEqual(departmental["rows"], 8)
         self.assertEqual(departmental["aliased_rows"], 4)
         self.assertEqual(departmental["deduplicated_aliases"], aliases)
+
+    def test_imope_original_catalog_paths_relative_to_parquet(self):
+        # Production build_release.py was run with the Parquet root as
+        # --source-root, so duplicates.tsv does not prefix 'parquet/'.
+        catalog = self.make_imope_dedup_alias(
+            relative_to_parquet=True,
+        )
+        with catalog.open(encoding="utf-8") as stream:
+            contents = stream.read()
+        self.assertIn(
+            "territoire-geospatial/cadastre/batiments/imope/",
+            contents,
+        )
+        self.assertNotIn(
+            "parquet/territoire-geospatial",
+            contents,
+        )
+        self.assertEqual(
+            self.run_pub("--duplicates-catalog", str(catalog)), 0,
+        )
+        result = publish(
+            plan_dir=self.plan, source_root=self.root,
+            output_root=self.outputs, writable_source_root=None,
+            prune_backup=True, execute=True, min_free_gib=0,
+            duplicates_catalog=catalog,
+        )
+        self.assertEqual(result["verified_batches"], 5)
+        index = json.loads(
+            (self.dirs["imope"] / "_COMPACTION_SOURCES.json").read_text()
+        )
+        alias = index["deduplicated_aliases"][0]
+        self.assertEqual(alias["original"], "67/alias.parquet")
+        self.assertEqual(alias["scope"], "imope")
+        self.assertEqual(alias["canonical"], "67/im-0.parquet")
+        self.assertEqual(alias["rows"], 4)
+
+    def test_imope_external_canonical_catalog_relative_to_parquet(self):
+        catalog = self.make_imope_dedup_alias(
+            canonical=self.excluded, relative_to_parquet=True,
+        )
+        result = publish(
+            plan_dir=self.plan, source_root=self.root,
+            output_root=self.outputs, writable_source_root=None,
+            prune_backup=True, execute=True, min_free_gib=0,
+            duplicates_catalog=catalog,
+        )
+        self.assertEqual(result["verified_batches"], 5)
+        index = json.loads(
+            (self.dirs["imope"] / "_COMPACTION_SOURCES.json").read_text()
+        )
+        alias = index["deduplicated_aliases"][0]
+        self.assertEqual(alias["scope"], "release")
+        self.assertEqual(
+            alias["published"], "parquet/other-dataset/keep.parquet",
+        )
 
     def test_imope_external_canonical_alias_is_release_scoped(self):
         catalog = self.make_imope_dedup_alias(canonical=self.excluded)
