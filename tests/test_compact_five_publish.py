@@ -173,6 +173,29 @@ class FiveDatasetPublicationTests(unittest.TestCase):
                 [entry for entry in selected if entry[0] == "waldec"],
             )
 
+    def test_datatourisme_csv_diagnostic_lists_discrepancies(self):
+        path = self.dirs["datatourisme"] / "manifest.json"
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+        metadata["csv"][0]["output"] = "csv/never-created.parquet"
+        self.put_json(path, metadata)
+        with self.assertRaisesRegex(
+            ValueError,
+            "missing_on_disk=1.*csv/never-created.parquet.*unlisted_on_disk=1.*csv/dataset.parquet",
+        ):
+            publish(
+                plan_dir=self.plan, source_root=self.root,
+                output_root=self.outputs, writable_source_root=None,
+                prune_backup=False, execute=False, min_free_gib=0,
+            )
+        self.assertTrue(
+            (self.dirs["datatourisme"] / "csv/dataset.parquet").exists()
+        )
+        self.assertFalse(
+            self.dirs["datatourisme"].with_name(
+                "datatourisme.precompact-backup"
+            ).exists()
+        )
+
     def test_preview_does_not_modify_sources(self):
         self.assertEqual(self.run_pub(), 0)
         self.assertEqual(len(list(self.root.rglob("*.parquet"))), 13)
