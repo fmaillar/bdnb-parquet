@@ -384,6 +384,22 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _catalog_release_parquet_path(raw: str) -> Path:
+    """Normalize the two known build-release catalog root conventions.
+
+    build_release.py emits paths relative to --source-root, which was
+    sometimes the Parquet directory itself (without 'parquet/') and sometimes
+    the release root (with 'parquet/'). In both cases catalog entries refer
+    exclusively to files within the release's parquet/ subtree.
+    """
+    rel = relative_path(raw)
+    if rel.parts[0] == "parquet":
+        if len(rel.parts) < 2:
+            raise ValueError(f"Empty Parquet catalog path: {raw!r}")
+        return rel
+    return Path("parquet") / rel
+
+
 def _imope_deduplicated_aliases(
     original: Path,
     source_root: Path,
@@ -449,7 +465,9 @@ def _imope_deduplicated_aliases(
         if not required.issubset(set(reader.fieldnames or [])):
             raise ValueError("SHA-256 catalog has missing required columns")
         for row in reader:
-            duplicate = relative_path(row["duplicate_path"]).as_posix()
+            duplicate = _catalog_release_parquet_path(
+                row["duplicate_path"],
+            ).as_posix()
             if not duplicate.startswith(prefix):
                 continue
             old = duplicate[len(prefix):]
@@ -463,12 +481,9 @@ def _imope_deduplicated_aliases(
                 )
             if old in found:
                 raise ValueError(f"IMoPE duplicate catalog has repeated entry: {old}")
-            canonical = relative_path(row["canonical_path"])
-            if not canonical.parts or canonical.parts[0] != "parquet":
-                raise ValueError(
-                    f"IMoPE canonical path is outside Parquet release: "
-                    f"{old} -> {canonical}"
-                )
+            canonical = _catalog_release_parquet_path(
+                row["canonical_path"],
+            )
             internal = canonical.as_posix().startswith(prefix)
             relative_canon = (
                 Path(canonical.as_posix()[len(prefix):])
