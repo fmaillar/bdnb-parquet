@@ -591,8 +591,11 @@ the physical release. Use the original `duplicates.tsv` catalog to prove
 the byte-identical canonical source for **every** missing path. Preflight
 verifies exact duplicate/canonical paths, original byte counts, real
 canonical SHA-256, row count, row groups, columns and GeoParquet status;
-no missing entry may be guessed from filename or schema. If a canonical
-file itself is compacted, aliases resolve to its final physical file and
+no missing entry may be guessed from filename or schema. Canonicals
+outside IMoPE remain release-scoped logical references if their physical
+paths stay unchanged; cross-dataset canonical files themselves scheduled
+for compaction are refused for manual audit. If an internal canonical
+file is compacted, its alias resolves to the new physical file and
 exact row range. Published metadata separates physical
 `rows` from `original_logical_rows` and preserves all aliases in
 `deduplicated_aliases` without recreating physical duplicates.
