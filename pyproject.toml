@@ -45,6 +45,7 @@ bdnb-parquet-compact-run = "bdnb_parquet.compact_run:main"
 bdnb-parquet-compact-schedule = "bdnb_parquet.compact_schedule:main"
 bdnb-parquet-compact-publish = "bdnb_parquet.compact_publish:main"
 bdnb-parquet-compact-all = "bdnb_parquet.compact_all:main"
+bdnb-parquet-compact-five = "bdnb_parquet.compact_five:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
