@@ -9,6 +9,7 @@ No other corpus datasets are touched.
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import csv
 import hashlib
 import errno
@@ -20,9 +21,11 @@ import stat
 import sys
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .compact_five import TARGETS, provenance_manifest, read_plan
@@ -163,18 +166,106 @@ def check_output_audit(selection: Any, output: Path, audit: Path) -> None:
             raise ValueError(f"Invalid output report {k}: {output}")
 
 
+def _verify_one_output(
+    selection: Any, output_root: Path, threads: int,
+) -> tuple[str, int]:
+    """Verify one independent compacted batch without writing anything."""
+    # Workers use separate processes so Arrow's global CPU/IO thread pools
+    # cannot oversubscribe one another.
+    pa.set_cpu_count(threads)
+    pa.set_io_thread_count(threads)
+    output, audit = output_paths(output_root, selection)
+    check_output_audit(selection, output, audit)
+    verified = verify(selection, output, batch_rows=16384, threads=threads)
+    if verified != sum(source.rows for source in selection.sources):
+        raise ValueError(f"Row verification failed: {selection.batch_id}")
+    return selection.batch_id, verified
+
+
 def verify_outputs(
     selected: list[tuple[str, Any, str]], output_root: Path,
+    *, workers: int = 1, threads: int = 4,
 ) -> None:
-    """Repeat full ordered logical Arrow comparison before destructive swap."""
-    for idx, (_key, selection, _category) in enumerate(selected, start=1):
-        output, audit = output_paths(output_root, selection)
-        check_output_audit(selection, output, audit)
-        verified = verify(selection, output, batch_rows=16384, threads=4)
-        if verified != sum(s.rows for s in selection.sources):
-            raise ValueError(f"Row verification failed: {selection.batch_id}")
-        print(f"CHECK [{idx}/{len(selected)}] {selection.batch_id}",
-              file=sys.stderr, flush=True)
+    """Read-only, full Arrow equality for all batches before staging.
+
+    Spawn up to four independent workers and bound pending tasks; on any
+    failed verification stop submitting new work and reject publication.
+    Every original/source comparison retains the old exact semantics.
+    """
+    if not 1 <= workers <= 4:
+        raise ValueError("--workers must be in [1, 4]")
+    if threads < 1:
+        raise ValueError("--threads must be positive")
+    selections = [selection for _key, selection, _category in selected]
+    total = len(selections)
+    complete = 0
+
+    def report(batch_id: str, verified: int) -> None:
+        nonlocal complete
+        complete += 1
+        print(
+            f"CHECK [{complete}/{total}] {batch_id}: {verified} verified rows",
+            file=sys.stderr, flush=True,
+        )
+
+    if workers == 1:
+        for selection in selections:
+            batch_id, verified = _verify_one_output(
+                selection, output_root, threads,
+            )
+            report(batch_id, verified)
+        return
+
+    # Match compact_schedule.run_schedule: 'spawn' isolates each worker's
+    # Arrow thread pool and at most workers batches are in-flight at once.
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=multiprocessing.get_context("spawn"),
+    ) as pool:
+        iterator = iter(selections)
+        in_flight: dict[Any, Any] = {}
+        errors: list[tuple[str, BaseException]] = []
+        stopped = False
+
+        def submit_one() -> bool:
+            try:
+                selection = next(iterator)
+            except StopIteration:
+                return False
+            future = pool.submit(
+                _verify_one_output, selection, output_root, threads,
+            )
+            in_flight[future] = selection
+            return True
+
+        for _ in range(min(workers, total)):
+            submit_one()
+        while in_flight:
+            completed, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in completed:
+                selection = in_flight.pop(future)
+                try:
+                    batch_id, verified = future.result()
+                    report(batch_id, verified)
+                except Exception as exc:
+                    stopped = True
+                    errors.append((selection.batch_id, exc))
+                    print(
+                        f"VERIFY FAILED {selection.batch_id}: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr, flush=True,
+                    )
+            if not stopped:
+                while len(in_flight) < workers and submit_one():
+                    pass
+
+        if errors:
+            first, exc = errors[0]
+            raise ValueError(
+                f"Full Arrow verification failed for {len(errors)} batch(es); "
+                f"first: {first}: {type(exc).__name__}: {exc}. "
+                "No publication staging or directory swaps attempted."
+            ) from exc
 
 
 def _stage_nt_parts(
@@ -1225,7 +1316,10 @@ def publish(
     output_root: Path, writable_source_root: Path | None,
     prune_backup: bool, execute: bool, min_free_gib: int = 20,
     duplicates_catalog: Path | None = None,
+    workers: int = 1, threads: int = 4,
 ) -> dict[str, Any]:
+    if not 1 <= workers <= 4 or threads < 1:
+        raise ValueError("Verification requires 1-4 workers and positive threads")
     root = source_root.expanduser().resolve()
     publish_root = (
         writable_source_root.expanduser().resolve()
@@ -1310,6 +1404,8 @@ def publish(
     overview = {
         "datasets": list(TARGETS),
         "candidate_batches": len(selected),
+        "verification_workers": workers,
+        "arrow_threads_per_worker": threads,
         "source_files": sum(v["source_files"] for v in inventory.values()),
         "candidate_files": sum(v["candidate_files"] for v in inventory.values()),
         "expected_reduction": sum(v["candidate_files"] - v["candidate_batches"]
@@ -1336,7 +1432,9 @@ def publish(
     swapped: list[str] = []
     # Strictly stage and validate all five before touching any original root.
     try:
-        verify_outputs(selected, output_root)
+        verify_outputs(
+            selected, output_root, workers=workers, threads=threads,
+        )
         for key, directory in paths.items():
             stage = directory.with_name(directory.name + ".compaction-stage")
             staged[key] = _build_stage(
@@ -1418,6 +1516,8 @@ def publish(
     report = {
         "datasets": list(TARGETS),
         "verified_batches": len(selected),
+        "verification_workers": workers,
+        "arrow_threads_per_worker": threads,
         "source_files": sum(x["source_files"] for x in staged.values()),
         "published_files": sum(x["published_files"] for x in staged.values()),
         "redundant_source_files": sum(x["removed_files"] for x in staged.values()),
@@ -1443,11 +1543,17 @@ def main(argv: list[str] | None = None) -> int:
         help="original SHA-256 release deduplication catalog (mandatory for IMoPE aliases)",
     )
     p.add_argument("--min-free-gib", type=int, default=20)
+    p.add_argument("--workers", type=int, choices=(1, 2, 3, 4), default=1,
+                   help="parallel verification processes (default: 1)")
+    p.add_argument("--threads", type=int, default=4,
+                   help="Arrow threads per verification worker (default: 4)")
     p.add_argument("--execute", action="store_true")
     p.add_argument("--prune-backup", action="store_true")
     args = p.parse_args(argv)
     if args.prune_backup and not args.execute:
         p.error("--prune-backup requires --execute")
+    if args.threads < 1:
+        p.error("--threads must be positive")
     try:
         publish(
             plan_dir=args.plan_dir, source_root=args.source_root,
@@ -1456,6 +1562,7 @@ def main(argv: list[str] | None = None) -> int:
             prune_backup=args.prune_backup, execute=args.execute,
             min_free_gib=args.min_free_gib,
             duplicates_catalog=args.duplicates_catalog,
+            workers=args.workers, threads=args.threads,
         )
         return 0
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
