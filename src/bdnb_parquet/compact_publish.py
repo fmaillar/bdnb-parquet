@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -391,6 +392,28 @@ def require_writable_publication_parent(dataset: Path) -> None:
     probe.rmdir()
 
 
+def prune_validated_backup(backup: Path) -> None:
+    """Remove an obsolete read-only BDNB backup, never touching its file modes.
+
+    The source conversion tree can use mode 0555 for directories. After the
+    newly published tree has been validated, chmod *only directories in the
+    backup* to allow unlinking obsolete source part files. Do not chmod
+    hardlinked Parquet files, which may also be used outside this backup.
+    """
+    if backup.is_symlink() or not backup.is_dir():
+        raise ValueError(f"Invalid backup to prune: {backup}")
+    for current_root, directories, files in os.walk(
+        backup, topdown=True, followlinks=False,
+    ):
+        current = Path(current_root)
+        if any((current / name).is_symlink() for name in (*directories, *files)):
+            raise ValueError(f"Refusing symlink in backup: {current}")
+        mode = current.stat().st_mode
+        if not mode & stat.S_IWUSR or not mode & stat.S_IXUSR:
+            os.chmod(current, mode | stat.S_IWUSR | stat.S_IXUSR)
+    shutil.rmtree(backup)
+
+
 def publish(
     source_root: Path, plan_dir: Path, compact_root: Path,
     tables_relative: str, *, prune_backup: bool,
@@ -438,7 +461,7 @@ def publish(
         )
 
     if prune_backup:
-        shutil.rmtree(backup)
+        prune_validated_backup(backup)
     report.update({
         "published_dataset": str(dataset),
         "backup": str(backup) if not prune_backup else None,
