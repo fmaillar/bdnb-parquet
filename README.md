@@ -518,3 +518,53 @@ through both native and bind-mount paths since the snapshot directory itself
 is not renamed. Original redundant BDNB parts are removed only after staging
 and publication validation. Subsequent global snapshot indexes or torrents
 must be rebuilt.
+
+## Five selected datasets: verified staging before destructive publication
+
+The next five source trees are:
+
+- `administration/associations/repertoire-national/waldec`
+- `tourisme/offre-nationale/datatourisme`
+- `territoire-geospatial/cadastre/batiments/imope`
+- `administration/associations/repertoire-national/import`
+- `climat-environnement/secheresse/vigieau`
+
+The existing planner groups by parent directory and serialized Arrow schema.
+That alone is NOT proof that files may replace one another: DataTourisme
+`ntriples/<snapshot>/part-00000.parquet` is a consecutive sequence, but
+IMoPE departmental files, Vigieau GeoJSON members and independent
+association sources can encode identity in their filenames and manifests.
+
+First inspect the actual candidate inventory without changing the snapshot:
+
+```bash
+bdnb-parquet-compact-five \
+  --plan-dir /mnt/data/parquet-compaction-plan \
+  --source-root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet
+```
+
+Stage all five datasets' candidate batches without changing or deleting
+any source. Exact Arrow schemas, metadata and logical row values are
+verified by the same bounded-memory runner used for BDNB:
+
+```bash
+bdnb-parquet-compact-five \
+  --plan-dir /mnt/data/parquet-compaction-plan \
+  --source-root /mnt/data/torrents/download/france-open-data-parquet-2026-10-10/parquet \
+  --output-root /mnt/data/parquet-compaction-other5 \
+  --workers 4 --threads 2 \
+  --execute --include-independent-files
+```
+
+The explicit `--include-independent-files` flag acknowledges that some
+candidates combine separately named inputs. It allows **staging only**,
+never source deletion. A durable
+`_meta/five-datasets-provenance.json` maps each output to all its
+original input paths, row ranges, schema and plan fingerprint. The
+existing scheduler journal records verified, resumable output batches.
+
+**Do not delete the original Parquet files or replace their manifest files
+from these staged results**. A dataset-specific publisher must update
+filename-based source references and validate source partition semantics
+before pruning them. The global snapshot/torrent manifest must be
+regenerated after all datasets have been safely published.
