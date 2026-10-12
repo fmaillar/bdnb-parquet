@@ -137,6 +137,48 @@ class PublishCompactionTests(unittest.TestCase):
         self.assertFalse(self.dataset.with_name("bdnb.compaction-stage").exists())
         self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 4)
 
+    def test_publisher_accepts_verified_native_alias_option(self):
+        self.compact()
+        alias = self.path / "native_alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        args = [
+            "--plan-dir", str(self.plan_dir),
+            "--source-root", str(self.root),
+            "--writable-source-root", str(alias),
+            "--output-root", str(self.output_root),
+            "--tables-root", self.tables_root,
+            "--execute", "--prune-backup",
+        ]
+        self.assertEqual(main(args), 0)
+        self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 2)
+        self.assertFalse(self.dataset.with_name("bdnb.precompact-backup").exists())
+
+    def test_publisher_rejects_unrelated_native_alias_before_verification(self):
+        self.compact()
+        wrong = self.path / "unrelated"
+        wrong.mkdir()
+        with self.assertRaisesRegex(ValueError, "exact same source"):
+            publish(
+                **self.kwargs(), prune_backup=True,
+                writable_source_root=wrong,
+            )
+        self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 4)
+        self.assertFalse(self.dataset.with_name("bdnb.compaction-stage").exists())
+
+    def test_cross_mount_link_failure_detected_before_long_verification(self):
+        self.compact()
+        with patch(
+            "bdnb_parquet.compact_publish.os.link",
+            side_effect=OSError(errno.EXDEV, "Invalid cross-device link"),
+        ), patch(
+            "bdnb_parquet.compact_publish.verify",
+            side_effect=AssertionError("Long verification should not begin"),
+        ):
+            with self.assertRaisesRegex(OSError, "writable-source-root"):
+                publish(**self.kwargs(), prune_backup=True)
+        self.assertEqual(len(list(self.tables.rglob("part-*.parquet"))), 4)
+        self.assertFalse(self.dataset.with_name("bdnb.compaction-stage").exists())
+
     def test_missing_compacted_output_does_not_touch_original(self):
         old_files = list(self.tables.rglob("*.parquet"))
         with self.assertRaises(FileNotFoundError):
