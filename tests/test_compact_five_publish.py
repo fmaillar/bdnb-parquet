@@ -186,8 +186,7 @@ class FiveDatasetPublicationTests(unittest.TestCase):
         self.put_json(manifest_path, listing)
         with self.assertRaisesRegex(
             ValueError,
-            "IMoPE manifest misses or duplicates physical inputs: "
-            ".*missing_on_disk=1.*67/not-present.parquet"
+            "IMoPE physical/manifest discrepancy: "
             ".*duplicate_references=1.*67/im-0.parquet",
         ):
             publish(
@@ -200,7 +199,7 @@ class FiveDatasetPublicationTests(unittest.TestCase):
     def test_imope_unlisted_file_is_not_silently_adopted(self):
         imope_dir = self.dirs["imope"]
         self.write_part(imope_dir / "67/unlisted.parquet", "imope", 50)
-        with self.assertRaisesRegex(ValueError, "Source file count changed"):
+        with self.assertRaisesRegex(ValueError, "unlisted_physical=1"):
             publish(
                 plan_dir=self.plan, source_root=self.root,
                 output_root=self.outputs, writable_source_root=None,
