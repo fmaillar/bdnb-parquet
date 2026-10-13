@@ -27,9 +27,10 @@ from .compact_publish import (
     copy_tree_hardlinks, link_file, prune_validated_backup,
     require_writable_publication_parent,
 )
-from .compact_run import relative_path, reject_overlapping_trees
+from .compact_run import compare_rows, relative_path, reject_overlapping_trees
 from .imope_promote import validate_parquet
 from .imope_v2_audit import ATTESTATION, sha256
+from .imope_v2_pilot import read_pilot
 from .imope_v2_schedule import _exclusive_staging_lock, inspect_plan, plan_fingerprint
 
 GIB = 2**30
@@ -282,6 +283,35 @@ def _preflight(
     }
 
 
+
+def _verify_current_source_values(data: dict[str, Any]) -> None:
+    """Refuse to publish if current source values diverged since attestation.
+
+    Footer/schema/size inventory checks cannot detect all in-place data
+    mutations. A final complete Arrow comparison runs *before* any swap
+    and independently validates every source against the attested output.
+    """
+    groups, _ = inspect_plan(data["plan"], data["root"], check_sources=False)
+    for number, group in enumerate(groups, 1):
+        selected, _, sources = read_pilot(
+            data["plan"], data["root"], batch_id=group["batch_id"],
+        )
+        output = data["output_root"] / relative_path(selected["output"])
+        verified = compare_rows(tuple(sources), output, 16384, threads=2)
+        if verified != selected["rows"]:
+            raise ValueError(
+                f"Original Arrow data changed since independent audit: "
+                f"{group['batch_id']}"
+            )
+        if number % 10 == 0 or number == len(groups):
+            print(
+                f"FINAL SOURCE CHECK [{number}/{len(groups)}] "
+                "all Arrow values still match",
+                file=sys.stderr, flush=True,
+            )
+
+
+
 def _build_replacement(data: dict[str, Any]) -> dict[str, Any]:
     root = data["root"]
     replacement = data["replacement"]
@@ -426,7 +456,7 @@ def _build_replacement(data: dict[str, Any]) -> dict[str, Any]:
                                 for a in lineage["deduplicated_aliases"]),
         "plan_sha256": plan_fingerprint(data["plan"]),
         "attestation_sha256": data["attestation_sha256"],
-        "publication_performed": False,
+        "publication_phase": "replacement-fully-validated-before-swap",
     }
     replace_json(replacement / "_COMPACTION_V2.json", report)
     # Original directories were immutable for the published snapshot. Restore
@@ -523,6 +553,7 @@ def publish(
             return overview
         require_writable_publication_parent(root)
         start = time.perf_counter()
+        _verify_current_source_values(data)
         swapped = False
         try:
             report = _build_replacement(data)
