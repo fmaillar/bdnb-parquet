@@ -742,8 +742,13 @@ bdnb-imope-v2-plan \
 Artifacts: `summary.json` (counts and uncertainty),
 `batches.json` (proposed cohorts, output names, bbox unions and explicit
 metadata-review warnings), `sources.tsv` (one original source per row,
-including department and source-to-proposed-output row offsets), and
-`untouched.json` (originals not selected for a batch). The proposal uses
+including department and source-to-proposed-output row offsets),
+`untouched.json` (originals not selected for a batch), and
+`pending_alias_rewrites.json` (exact future physical paths and row offsets
+for existing IMoPE logical aliases whose canonicals would be regrouped).
+The planner reads the current `_COMPACTION_SOURCES.json` when present,
+counts all recorded logical aliases, and refuses malformed internal alias
+references; it does not modify or repair those references. The proposal uses
 source file sizes, which cannot predict compressed output sizes exactly.
 
 **Do not run a second compaction or remove the five
