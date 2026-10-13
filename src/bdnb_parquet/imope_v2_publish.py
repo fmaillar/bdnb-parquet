@@ -630,8 +630,14 @@ def prune_published_v2_backup(
         or data.get("plan_sha256") != fingerprint
         or data.get("attestation_sha256")
         != sha256(stage / "_meta" / ATTESTATION)
-        or data.get("input_physical_files") != 3360
-        or data.get("published_files") != 213
+        or data.get("input_physical_files")
+        != attested["lineage"]["original_physical_files"]
+        or data.get("published_files")
+        != (
+            data["input_physical_files"]
+            - attested["validated_sources"]
+            + attested["validated_batches"]
+        )
         or data.get("new_compacts") != attested.get("validated_batches")
         or data.get("aliases_retargeted") !=
         attested["lineage"]["aliases_requiring_retarget"]):
