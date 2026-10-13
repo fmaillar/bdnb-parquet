@@ -758,3 +758,65 @@ metadata regeneration, full Arrow equality checks, an updated IMoPE
 department/alias index, and transactional publication with preserved
 backups. The existing 187 SHA-256 aliases must continue resolving after
 any future physical reorganization.
+
+
+## IMoPE v2: isolated 2048 MiB compaction pilot
+
+**Chosen planning target: 2048 MiB (2 GiB).** The metadata-only
+plan projected **213 physical IMoPE Parquet files**, down from 3,360:
+92 proposed new outputs, 27 unchanged un-compacted physical files and
+94 already-compacted outputs. This is a file-count *projection*, not a
+promise of exact compressed output sizes.
+
+Before any second publication, an isolated pilot can test the *actual*
+Arrow streaming and GeoParquet metadata regeneration. The pilot does not
+replace the IMoPE directory, modify source Parquet, alter source indices
+or aliases, touch any of the five `.precompact-backup` directories,
+or change torrents.
+
+First, produce a new **external** 2048 MiB plan (not under IMoPE):
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bdnb_parquet.imope_v2_plan \
+  --root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet/territoire-geospatial/cadastre/batiments/imope \
+  --target-mib 2048 \
+  --output-dir /mnt/data/imope-v2-plan-2048
+```
+
+Preview the **smallest GeoParquet batch** without writing:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bdnb_parquet.imope_v2_pilot \
+  --plan-dir /mnt/data/imope-v2-plan-2048 \
+  --source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet/territoire-geospatial/cadastre/batiments/imope \
+  --pick smallest-geo
+```
+
+Only after reviewing the selected sources, perform the isolated pilot
+with an unused output directory:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bdnb_parquet.imope_v2_pilot \
+  --plan-dir /mnt/data/imope-v2-plan-2048 \
+  --source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet/territoire-geospatial/cadastre/batiments/imope \
+  --output-root /mnt/data/imope-v2-pilot-small-2048 \
+  --pick smallest-geo --threads 2 --execute
+```
+
+The command reads source footers again, regenerates the union of recorded
+GeoParquet bboxes, writes a new Zstandard Parquet file via bounded Arrow
+batches and verifies **all ordered Arrow values and output metadata** before
+the pilot output becomes visible. It writes a JSON report with input
+provenance and timings. A failure never replaces original files. Existing
+output directories are refused, not overwritten.
+
+For a more demanding trial, rerun with `--pick largest-geo` and a
+**different new output directory**. The two trials serve different goals:
+first functional correctness, then throughput and memory measurements.
+
+Caveats: the bbox union is derived from source metadata rather than
+recalculated from geometries themselves. The pilot report explicitly notes
+that geometry-level validation remains outstanding. Neither pilot authorizes
+replacing the existing 3,360-file IMoPE publication, resolving the 90
+potential alias redirects, or deleting backups. A full multi-worker
+publisher and independent geometry/manifest audits require separate review.
