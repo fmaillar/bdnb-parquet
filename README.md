@@ -1003,6 +1003,21 @@ After the swap, it rechecks every new output SHA-256 plus all metadata
 references. An ordinary post-swap error attempts to restore the original
 directory; a power failure may require manual recovery.
 
+**Separate, preferred cleanup after inspecting the published output:**
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bdnb_parquet.imope_v2_publish \
+  --plan-dir /mnt/data/imope-v2-plan-2048 \
+  --source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet/territoire-geospatial/cadastre/batiments/imope \
+  --stage-root /mnt/data/imope-v2-stage-2048 \
+  --prune-backup-only
+```
+
+This separate command **revalidates all newly published files by their
+attested SHA-256 and row-index references, verifies old backup metadata,
+then removes only the distinct v2 rollback backup**. It does not require
+rerunning the staging operation and cannot be run before publication.
+
 The original pre-v2 published directory is retained by default at the
 sibling path `imope.imope-v2-prepublish-backup`. This backup is distinct
 from the five previous `.precompact-backup` directories and must not
