@@ -9,6 +9,7 @@ change. Existing outputs are *fully* compared with current originals on resume.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import multiprocessing
@@ -17,6 +18,8 @@ import shutil
 import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import contextmanager
+from typing import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -290,69 +293,37 @@ def _budget(
     }
 
 
-def schedule(
-    plan_dir: Path, source_root: Path, output_root: Path, *,
-    workers: int = 4, threads: int = 2,
-    batch_rows: int = 16384, row_group_rows: int = 100000,
-    max_buffer_mib: int = 128, zstd_level: int = 3,
-    min_free_gib: int = 20, execute: bool = False,
-) -> dict[str, Any]:
-    if not 1 <= workers <= 4 or threads < 1:
-        raise ValueError("Scheduler requires 1-4 workers and positive Arrow threads")
-    if (min(batch_rows, row_group_rows, max_buffer_mib) < 1
-        or not 1 <= zstd_level <= 19 or min_free_gib < 0):
-        raise ValueError("Invalid resource or compression limit")
-    plan = plan_dir.expanduser().resolve()
-    root = source_root.expanduser().resolve()
-    output = output_root.expanduser().resolve()
-    reject_overlapping_trees(root, output)
-    reject_overlapping_trees(plan, output)
-    if output.is_symlink() or output == root or output == plan:
-        raise ValueError("Unsafe schedule output root")
-    # A true preview performs all expensive source checks but never creates
-    # or modifies directories/files, including audit journals.
-    groups, summary = inspect_plan(plan, root, check_sources=True)
-    fingerprint = plan_fingerprint(plan)
-    preview = {
-        "mode": "execute-staging-only" if execute else "read-only",
-        "target_mib": PILOT_TARGET_MIB,
-        "batches": len(groups),
-        "source_files": summary["candidate_source_files"],
-        "source_rows": summary["candidate_rows"],
-        "source_bytes": summary["candidate_bytes"],
-        "projected_physical_files": summary["projected_physical_files"],
-        "workers": workers, "threads_per_worker": threads,
-        "output_root": str(output),
-        "plan_sha256": fingerprint,
-        "source_files_untouched": True,
-        "publication_performed": False,
-        "source_backup_deleted": False,
-    }
-    print(json.dumps(preview, indent=2, ensure_ascii=False), flush=True)
-    if not execute:
-        return preview
+@contextmanager
+def _exclusive_staging_lock(metadata: Path) -> Iterator[None]:
+    """Prevent two independently launched schedulers from racing on outputs."""
+    lock_file = metadata / "schedule.lock"
+    if lock_file.is_symlink():
+        raise ValueError(f"Unsafe staging lock symlink: {lock_file}")
+    fd = os.open(
+        lock_file,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                "Another IMoPE v2 staging scheduler is using this output root"
+            ) from exc
+        yield
+    finally:
+        os.close(fd)
 
-    lock = {"format": "imope-v2-stage-lock-v1", "root": str(root),
-            "plan_sha256": fingerprint, "target_mib": PILOT_TARGET_MIB}
-    is_resume = output.exists() or output.is_symlink()
-    if is_resume:
-        if not output.is_dir() or output.is_symlink():
-            raise ValueError("Existing staging root is not a safe directory")
-        metadata = output / "_meta"
-        lock_path = metadata / "plan-lock.json"
-        if metadata.is_symlink() or lock_path.is_symlink() or not lock_path.is_file():
-            raise ValueError(
-                "Existing output cannot be resumed without original plan lock"
-            )
-        if json.loads(lock_path.read_text(encoding="utf-8")) != lock:
-            raise ValueError("Existing output belongs to a different plan")
-    else:
-        if not output.parent.is_dir() or output.parent.is_symlink():
-            raise ValueError(f"Unsafe or absent output parent: {output.parent}")
-        output.mkdir(mode=0o700)
-        metadata = output / "_meta"
-        metadata.mkdir()
-        atomic_report(metadata / "plan-lock.json", lock)
+
+def _run_staging(
+    groups: list[dict[str, Any]], output: Path, metadata: Path,
+    plan: Path, root: Path, *, workers: int, threads: int,
+    batch_rows: int, row_group_rows: int,
+    max_buffer_mib: int, zstd_level: int, min_free_gib: int,
+    is_resume: bool,
+) -> dict[str, Any]:
+    """Mutating phase, always called under the exclusive output lock."""
     budget = _budget(output, groups, workers, min_free_gib)
     journal = metadata / "imope-v2-compaction-journal.jsonl"
     append_event(journal, {
@@ -495,6 +466,79 @@ def schedule(
     print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
     return result
 
+
+
+def schedule(
+    plan_dir: Path, source_root: Path, output_root: Path, *,
+    workers: int = 4, threads: int = 2,
+    batch_rows: int = 16384, row_group_rows: int = 100000,
+    max_buffer_mib: int = 128, zstd_level: int = 3,
+    min_free_gib: int = 20, execute: bool = False,
+) -> dict[str, Any]:
+    if not 1 <= workers <= 4 or threads < 1:
+        raise ValueError("Scheduler requires 1-4 workers and positive Arrow threads")
+    if (min(batch_rows, row_group_rows, max_buffer_mib) < 1
+        or not 1 <= zstd_level <= 19 or min_free_gib < 0):
+        raise ValueError("Invalid resource or compression limit")
+    plan = plan_dir.expanduser().resolve()
+    root = source_root.expanduser().resolve()
+    output = output_root.expanduser().resolve()
+    reject_overlapping_trees(root, output)
+    reject_overlapping_trees(plan, output)
+    if output.is_symlink() or output == root or output == plan:
+        raise ValueError("Unsafe schedule output root")
+    # A true preview performs all expensive source checks but never creates
+    # or modifies directories/files, including audit journals.
+    groups, summary = inspect_plan(plan, root, check_sources=True)
+    fingerprint = plan_fingerprint(plan)
+    preview = {
+        "mode": "execute-staging-only" if execute else "read-only",
+        "target_mib": PILOT_TARGET_MIB,
+        "batches": len(groups),
+        "source_files": summary["candidate_source_files"],
+        "source_rows": summary["candidate_rows"],
+        "source_bytes": summary["candidate_bytes"],
+        "projected_physical_files": summary["projected_physical_files"],
+        "workers": workers, "threads_per_worker": threads,
+        "output_root": str(output),
+        "plan_sha256": fingerprint,
+        "source_files_untouched": True,
+        "publication_performed": False,
+        "source_backup_deleted": False,
+    }
+    print(json.dumps(preview, indent=2, ensure_ascii=False), flush=True)
+    if not execute:
+        return preview
+
+    lock = {"format": "imope-v2-stage-lock-v1", "root": str(root),
+            "plan_sha256": fingerprint, "target_mib": PILOT_TARGET_MIB}
+    is_resume = output.exists() or output.is_symlink()
+    if is_resume:
+        if not output.is_dir() or output.is_symlink():
+            raise ValueError("Existing staging root is not a safe directory")
+        metadata = output / "_meta"
+        lock_path = metadata / "plan-lock.json"
+        if metadata.is_symlink() or lock_path.is_symlink() or not lock_path.is_file():
+            raise ValueError(
+                "Existing output cannot be resumed without original plan lock"
+            )
+        if json.loads(lock_path.read_text(encoding="utf-8")) != lock:
+            raise ValueError("Existing output belongs to a different plan")
+    else:
+        if not output.parent.is_dir() or output.parent.is_symlink():
+            raise ValueError(f"Unsafe or absent output parent: {output.parent}")
+        output.mkdir(mode=0o700)
+        metadata = output / "_meta"
+        metadata.mkdir()
+        atomic_report(metadata / "plan-lock.json", lock)
+    with _exclusive_staging_lock(metadata):
+        return _run_staging(
+            groups, output, metadata, plan, root,
+            workers=workers, threads=threads,
+            batch_rows=batch_rows, row_group_rows=row_group_rows,
+            max_buffer_mib=max_buffer_mib, zstd_level=zstd_level,
+            min_free_gib=min_free_gib, is_resume=is_resume,
+        )
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
