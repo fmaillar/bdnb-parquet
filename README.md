@@ -967,7 +967,8 @@ redundant old Parquet remains in the replacement dataset.
 
 It first verifies the immutable plan and independent attestation
 fingerprints, hashes each staged output Parquet against the 92 original
-attested SHA-256 values, confirms the existing departmental Parquet
+attested SHA-256 values, **recompares all source Arrow values with the
+validated outputs immediately before any swap**, and confirms the departmental Parquet
 manifest and all 187 aliases, and refuses any extra files.
 
 **Dry-run / preflight (default, no changes to published files):**
