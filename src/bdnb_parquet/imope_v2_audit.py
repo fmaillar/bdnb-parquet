@@ -336,6 +336,18 @@ def validate(plan: Path, root: Path, stage: Path, *,
                     raise RuntimeError(f"Independent audit failed: {error}") from error
 
         outputs.sort(key=lambda x: x["batch_id"])
+        expected_outputs = {item["output"] for item in outputs}
+        actual_outputs = {
+            item.relative_to(stage).as_posix()
+            for item in stage.rglob("*.parquet")
+        }
+        if actual_outputs != expected_outputs:
+            raise ValueError(
+                "Unexpected/missing physical staged Parquet: "
+                f"expected={len(expected_outputs)} actual={len(actual_outputs)} "
+                f"extra={sorted(actual_outputs - expected_outputs)[:5]} "
+                f"missing={sorted(expected_outputs - actual_outputs)[:5]}"
+            )
         if (len(outputs) != len(groups)
             or sum(x["rows"] for x in outputs) != summary["candidate_rows"]
             or sum(x["sources"] for x in outputs) != summary["candidate_source_files"]):
