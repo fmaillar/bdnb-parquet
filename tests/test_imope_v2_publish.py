@@ -16,7 +16,7 @@ from bdnb_parquet.imope_promote import validate_parquet
 from bdnb_parquet.imope_v2_plan import build_plan, write_plan
 from bdnb_parquet.imope_v2_schedule import schedule
 from bdnb_parquet.imope_v2_audit import validate
-from bdnb_parquet.imope_v2_publish import BACKUP_SUFFIX, publish
+from bdnb_parquet.imope_v2_publish import BACKUP_SUFFIX, publish, prune_published_v2_backup
 
 
 class IMoPEV2PublisherTests(unittest.TestCase):
@@ -196,6 +196,21 @@ class IMoPEV2PublisherTests(unittest.TestCase):
         self.assertFalse(
             self.root.with_name(self.root.name + BACKUP_SUFFIX).exists()
         )
+        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 3)
+
+    def test_separate_cleanup_checks_published_tree_before_deleting_backup(self):
+        publish(
+            self.plan, self.root, self.outputs,
+            execute=True, min_free_gib=0,
+        )
+        backup = self.root.with_name(self.root.name + BACKUP_SUFFIX)
+        self.assertTrue(backup.exists())
+        result = prune_published_v2_backup(
+            self.plan, self.root, self.outputs,
+        )
+        self.assertTrue(result["publication_validated"])
+        self.assertTrue(result["backup_pruned"])
+        self.assertFalse(backup.exists())
         self.assertEqual(len(list(self.root.rglob("*.parquet"))), 3)
 
     def test_wrong_stage_bytes_rejected_before_any_swap(self):
