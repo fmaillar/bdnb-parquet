@@ -47,6 +47,7 @@ bdnb-parquet-compact-publish = "bdnb_parquet.compact_publish:main"
 bdnb-parquet-compact-all = "bdnb_parquet.compact_all:main"
 bdnb-parquet-compact-five = "bdnb_parquet.compact_five:main"
 bdnb-parquet-compact-five-publish = "bdnb_parquet.compact_five_publish:main"
+bdnb-imope-v2-plan = "bdnb_parquet.imope_v2_plan:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
