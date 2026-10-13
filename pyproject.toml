@@ -17,6 +17,7 @@ dependencies = [
   "ijson>=3.3",
   "xlrd>=2.0",
   "openpyxl>=3.1",
+  "shapely>=2.0,<3",
   "pandas>=2.2",
 ]
 
@@ -50,6 +51,7 @@ bdnb-parquet-compact-five-publish = "bdnb_parquet.compact_five_publish:main"
 bdnb-imope-v2-plan = "bdnb_parquet.imope_v2_plan:main"
 bdnb-imope-v2-pilot = "bdnb_parquet.imope_v2_pilot:main"
 bdnb-imope-v2-schedule = "bdnb_parquet.imope_v2_schedule:main"
+bdnb-imope-v2-audit = "bdnb_parquet.imope_v2_audit:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
