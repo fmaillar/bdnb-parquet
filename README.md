@@ -820,3 +820,74 @@ that geometry-level validation remains outstanding. Neither pilot authorizes
 replacing the existing 3,360-file IMoPE publication, resolving the 90
 potential alias redirects, or deleting backups. A full multi-worker
 publisher and independent geometry/manifest audits require separate review.
+
+
+## IMoPE v2: four-worker staging of all 2048 MiB batches
+
+Following the successful ~2 GiB nine-file `parcelle.parquet` pilot
+(8,797,706 original rows compared exhaustively, no original touched),
+`bdnb-imope-v2-schedule` stages the complete plan in a **separate
+output directory**. It does **not** publish, overwrite source files,
+remove backups, regenerate global checksums or modify torrents.
+
+Selected release target: **2048 MiB (2 GiB)**, with **4 independent
+process workers and 2 Arrow threads per worker**. The real read-only
+plan proposed 92 compacted output files from 3,239 existing physical
+sources, leaving 27 singleton source files and retaining 94 previously
+published compacted files, for 213 projected physical files after a
+future, separately reviewed publication. The 187 logical aliases (90
+requiring retargeting) are not rewritten by the scheduler.
+
+Use the existing `/mnt/data/imope-v2-plan-2048` **only if its original
+SHA-256-locked planner artifacts are still present**. A new plan is
+required if the sources have changed, but an existing staging directory
+cannot be reused for a different plan.
+
+Preflight all 92 source inventories, schemas and bounding-box profiles,
+without creating files:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bdnb_parquet.imope_v2_schedule \
+  --plan-dir /mnt/data/imope-v2-plan-2048 \
+  --source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet/territoire-geospatial/cadastre/batiments/imope \
+  --output-root /mnt/data/imope-v2-stage-2048 \
+  --workers 4 --threads 2
+```
+
+Once the preflight succeeds and free disk capacity is confirmed, opt in
+to writing only the **new external** staging directory:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bdnb_parquet.imope_v2_schedule \
+  --plan-dir /mnt/data/imope-v2-plan-2048 \
+  --source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet/territoire-geospatial/cadastre/batiments/imope \
+  --output-root /mnt/data/imope-v2-stage-2048 \
+  --workers 4 --threads 2 --execute
+```
+
+All selected sources are re-inspected. Each worker writes one temporary
+Parquet and compares every ordered Arrow value plus output schema,
+GeoParquet metadata and row count *before* it makes the validated
+file visible. Only workers owning their output path write into the stage.
+The new root is guarded by an immutable plan fingerprint, a
+nonblocking exclusive `schedule.lock` and an append-only durable journal
+under `_meta/`. At most four batches are in flight. On the first
+failure, the scheduler starts no new jobs, finishes the in-flight jobs
+and records an unsuccessful run.
+
+**Resume** by repeating the identical command and output root. For
+every existing completed batch it validates its JSON audit, file size,
+schema, bounding box and **all Arrow values again**; it does not blindly
+trust the old success journal. Existing outputs without their audit
+files, incomplete `.partial` files, divergent plan fingerprints and
+pre-existing unrelated output roots fail closed for manual inspection.
+Do not manually delete or replace a `.partial` without inspecting it
+and confirming that it belongs to this staging attempt.
+
+The final `_meta/last-run.json` should show
+`successful_batches == selected_batches`, `failed_batches == 0`,
+and the planned source row total. This still does **not** authorize
+publishing IMoPE: a separate audit must independently validate the
+WKB/GeoParquet coordinate extents, source-to-batch row mappings, the
+departmental manifests, and all 187 aliases before any directory
+swaps. Keep the existing five `.precompact-backup` copies.
