@@ -158,6 +158,91 @@ def _union_bboxes(
     return union, warnings
 
 
+def _audit_prior_aliases(
+    root: Path, planned_sources: list[dict[str, Any]],
+) -> tuple[dict[str, int | bool], list[dict[str, Any]]]:
+    """Identify prior IMoPE aliases affected by the proposed regrouping.
+
+    This is provenance *planning*, not a metadata rewrite. In particular,
+    SHA-256 authenticated aliases external to IMoPE are never assumed to
+    be safely remappable to a new physical file.
+    """
+    index_file = root / "_COMPACTION_SOURCES.json"
+    if index_file.is_symlink():
+        raise ValueError(f"Unsafe existing IMoPE source index: {index_file}")
+    if not index_file.exists():
+        return {
+            "existing_source_index_present": False,
+            "existing_logical_aliases": 0,
+            "existing_aliases_requiring_retarget": 0,
+            "existing_release_scoped_aliases": 0,
+        }, []
+    index = json.loads(index_file.read_text(encoding="utf-8"))
+    if not isinstance(index, dict) or index.get("dataset") != "imope":
+        raise ValueError("Unexpected existing IMoPE compaction source index")
+    aliases = index.get("deduplicated_aliases")
+    if not isinstance(aliases, list):
+        raise ValueError("Existing IMoPE alias inventory missing")
+    mapping = {source["original"]: source for source in planned_sources}
+    rewritten: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    external = 0
+
+    for alias in sorted(aliases, key=lambda x: x["original"]):
+        original = alias.get("original")
+        if not isinstance(original, str) or original in seen:
+            raise ValueError("Duplicate or invalid existing IMoPE alias name")
+        seen.add(original)
+        scope = alias.get("published_scope")
+        raw = alias.get("published")
+        if not isinstance(raw, str):
+            raise ValueError(f"Invalid IMoPE alias physical path: {original}")
+        physical = Path(raw)
+        if physical.is_absolute() or ".." in physical.parts or not physical.parts:
+            raise ValueError(f"Unsafe IMoPE alias physical path: {original}")
+        start = alias.get("first_row")
+        length = alias.get("rows")
+        if (type(start) is not int or type(length) is not int
+            or start < 0 or length < 0):
+            raise ValueError(f"Unsafe IMoPE alias row range: {original}")
+
+        if scope == "release":
+            if physical.parts[0] != "parquet":
+                raise ValueError(f"Unsafe external IMoPE alias path: {original}")
+            external += 1
+            continue
+        if scope != "imope":
+            raise ValueError(f"Unknown IMoPE alias scope: {scope}")
+        file = root / physical
+        if file.is_symlink() or not file.is_file():
+            raise ValueError(f"Existing IMoPE canonical file missing: {physical}")
+        if physical.as_posix() not in mapping:
+            # Canonical file is not selected for a second regrouping.
+            continue
+        target = mapping[physical.as_posix()]
+        if start + length > target["rows"]:
+            raise ValueError(
+                f"IMoPE existing alias row range exceeds original: {original}"
+            )
+        rewritten.append({
+            "original_alias": original,
+            "previous_canonical": physical.as_posix(),
+            "previous_first_row": start,
+            "rows": length,
+            "proposed_output": target["output"],
+            "proposed_first_row": target["first_row"] + start,
+            "original_sha256": alias.get("sha256"),
+            "action": "future-index-migration-required-NOT-executed",
+        })
+
+    return {
+        "existing_source_index_present": True,
+        "existing_logical_aliases": len(aliases),
+        "existing_aliases_requiring_retarget": len(rewritten),
+        "existing_release_scoped_aliases": external,
+    }, rewritten
+
+
 def build_plan(root: Path, *, target_mib: int = DEFAULT_TARGET_MIB) -> dict[str, Any]:
     """Inspect source footers only, then bin-pack each exact-safe cohort.
 
@@ -251,7 +336,11 @@ def build_plan(root: Path, *, target_mib: int = DEFAULT_TARGET_MIB) -> dict[str,
     file_reduction = source_count - batch_count
     proposed_rows = sum(x["rows"] for x in proposed_sources)
     untouched_rows = sum(x["rows"] for x in untouched)
+    prior_alias_stats, pending_alias_rewrites = _audit_prior_aliases(
+        root, proposed_sources,
+    )
     summary = {
+        **prior_alias_stats,
         "format": "imope-v2-physical-planning-v1",
         "mode": "read-only",
         "root": str(root),
@@ -294,6 +383,7 @@ def build_plan(root: Path, *, target_mib: int = DEFAULT_TARGET_MIB) -> dict[str,
         "batches": batches,
         "sources": proposed_sources,
         "untouched": untouched,
+        "pending_alias_rewrites": pending_alias_rewrites,
     }
 
 
@@ -311,7 +401,7 @@ def write_plan(plan: dict[str, Any], directory: Path, root: Path) -> None:
         raise ValueError(f"Plan parent missing or unsafe: {directory.parent}")
     directory.mkdir(mode=0o700)
     try:
-        for key in ("summary", "batches", "untouched"):
+        for key in ("summary", "batches", "untouched", "pending_alias_rewrites"):
             data = plan[key]
             (directory / f"{key}.json").write_text(
                 json.dumps(data, ensure_ascii=False, indent=2) + "\n",
@@ -338,7 +428,7 @@ def write_plan(plan: dict[str, Any], directory: Path, root: Path) -> None:
                 })
     except BaseException:
         # Only cleanup the newly created plan directory, never any source.
-        for name in ("summary.json", "batches.json", "untouched.json", "sources.tsv"):
+        for name in ("summary.json", "batches.json", "untouched.json", "pending_alias_rewrites.json", "sources.tsv"):
             (directory / name).unlink(missing_ok=True)
         directory.rmdir()
         raise
