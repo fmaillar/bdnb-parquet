@@ -24,6 +24,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import pyarrow.parquet as pq
+
 MIB = 2**20
 TORRENT_PIECE_MIB = 32
 BACKUP_SUFFIXES = (
@@ -34,7 +36,7 @@ BACKUP_SUFFIXES = (
     ".failed-published",
     ".imope-v2-failed-published",
 )
-TSV_COLUMNS = ("path", "bytes", "sha256", "kind")
+TSV_COLUMNS = ("path", "bytes", "sha256", "kind", "rows", "row_groups")
 
 
 @dataclass(frozen=True)
@@ -185,7 +187,8 @@ def _encoded_size(records: list[SnapshotFile], name: str,
 
 def audit(root: Path, *, output_dir: Path | None = None,
           write_manifest: bool = False,
-          piece_mib: int = TORRENT_PIECE_MIB) -> dict:
+          piece_mib: int = TORRENT_PIECE_MIB,
+          verify_parquet: bool = False) -> dict:
     if piece_mib <= 0 or piece_mib & (piece_mib - 1):
         raise ValueError("--piece-mib must be a positive power of two")
     if write_manifest and output_dir is None:
@@ -196,6 +199,10 @@ def audit(root: Path, *, output_dir: Path | None = None,
     files, excluded = inventory(root)
     bytes_total = sum(rec.size for rec in files)
     parquet = [rec for rec in files if rec.relative.endswith(".parquet")]
+    partial = [
+        rec.relative for rec in files
+        if rec.relative.endswith((".partial", ".partial.parquet", ".tmp"))
+    ]
     summary: dict = {
         "format": "france-open-data-snapshot-inventory-v1",
         "root": str(root),
@@ -205,6 +212,9 @@ def audit(root: Path, *, output_dir: Path | None = None,
         "payload_gib": round(bytes_total / 2**30, 4),
         "parquet_files": len(parquet),
         "other_files": len(files) - len(parquet),
+        "suspicious_partial_files": partial[:30],
+        "suspicious_partial_file_count": len(partial),
+        "parquet_footer_verification": verify_parquet,
         "piece_mib": piece_mib,
         "v1_pieces": math.ceil(bytes_total / (piece_mib * MIB)),
         "v1_info_size_without_trackers": _encoded_size(files, root.name, piece_mib),
@@ -212,11 +222,21 @@ def audit(root: Path, *, output_dir: Path | None = None,
             _encoded_size(files, root.name, piece_mib) < 10 * MIB,
         "excluded_backup_or_stage_directories": excluded,
         "excluded_directories_count": len(excluded),
-        "torrent_payload_root_not_clean": bool(excluded),
+        "torrent_payload_root_not_clean": bool(excluded or partial),
         "torrent_created": False,
         "published_files_modified": False,
     }
     if not write_manifest:
+        if verify_parquet:
+            total_rows = 0
+            for index, rec in enumerate(parquet, 1):
+                _verify_stable(rec)
+                total_rows += pq.read_metadata(rec.path).num_rows
+                _verify_stable(rec)
+                if index % 1000 == 0 or index == len(parquet):
+                    print(f"FOOTER [{index}/{len(parquet)}]", file=sys.stderr)
+            summary["parquet_rows"] = total_rows
+            summary["parquet_footers_verified"] = len(parquet)
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return summary
 
@@ -225,6 +245,7 @@ def audit(root: Path, *, output_dir: Path | None = None,
     manifest = out / "files.sha256.tsv"
     first = time.perf_counter()
     counts = {"parquet": 0, "other": 0}
+    parquet_rows = 0
     # File is opened and hashed exactly once. The sorted stable relative
     # paths also define a reproducible future BitTorrent file-list order.
     with manifest.open("x", encoding="utf-8", newline="") as fh:
@@ -232,7 +253,17 @@ def audit(root: Path, *, output_dir: Path | None = None,
         writer.writerow(TSV_COLUMNS)
         for index, rec in enumerate(files, 1):
             suffix = "parquet" if rec.relative.endswith(".parquet") else "other"
-            writer.writerow([rec.relative, rec.size, _digest(rec), suffix])
+            digest = _digest(rec)
+            rows = row_groups = ""
+            if verify_parquet and suffix == "parquet":
+                _verify_stable(rec)
+                footer = pq.read_metadata(rec.path)
+                rows, row_groups = int(footer.num_rows), int(footer.num_row_groups)
+                parquet_rows += rows
+                _verify_stable(rec)
+            writer.writerow([
+                rec.relative, rec.size, digest, suffix, rows, row_groups,
+            ])
             counts[suffix] += 1
             if index % 250 == 0 or index == len(files):
                 print(
@@ -258,8 +289,10 @@ def audit(root: Path, *, output_dir: Path | None = None,
         "manifest_sha256": manifest_sha,
         "parquet_hashed": counts["parquet"],
         "other_hashed": counts["other"],
+        "parquet_rows": parquet_rows if verify_parquet else None,
+        "parquet_footers_verified": len(parquet) if verify_parquet else 0,
         "elapsed_seconds": round(time.perf_counter() - first, 3),
-        "torrent_ready": not bool(excluded),
+        "torrent_ready": not bool(excluded or partial),
     })
     with (out / "summary.json").open("x", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False)
@@ -277,12 +310,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--write-manifest", action="store_true")
+    parser.add_argument("--verify-parquet", action="store_true",
+                        help="read and validate all Parquet file footers and row counts")
     parser.add_argument("--piece-mib", type=int, default=32)
     args = parser.parse_args(argv)
     try:
         audit(
             args.root, output_dir=args.output_dir,
             write_manifest=args.write_manifest, piece_mib=args.piece_mib,
+            verify_parquet=args.verify_parquet,
         )
         return 0
     except (ValueError, OSError, RuntimeError) as exc:
