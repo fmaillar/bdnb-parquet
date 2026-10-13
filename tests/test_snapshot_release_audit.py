@@ -7,6 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from bdnb_parquet.snapshot_release_audit import audit, inventory
 
 
@@ -18,7 +21,7 @@ class SnapshotReleaseAuditTests(unittest.TestCase):
         self.root = self.base / "france-open-data-parquet-2026-10-10"
         (self.root / "parquet" / "dataset").mkdir(parents=True)
         self.a = self.root / "parquet" / "dataset" / "compact-v2.parquet"
-        self.a.write_bytes(b"actual-published-parquet")
+        pq.write_table(pa.table({"id": [1, 2, 3]}), self.a)
         self.b = self.root / "parquet" / "dataset" / "dataset.json"
         self.b.write_text('{"rows": 1}\n')
         backup = self.root / "parquet" / "dataset.precompact-backup"
@@ -89,6 +92,19 @@ class SnapshotReleaseAuditTests(unittest.TestCase):
         (self.root / "old.torrent").write_bytes(b"stale")
         with self.assertRaisesRegex(ValueError, "Torrent file inside"):
             audit(self.root)
+
+    def test_all_parquet_footers_and_row_counts(self):
+        output = self.base / "verified-manifest"
+        result = audit(
+            self.root, output_dir=output,
+            write_manifest=True, verify_parquet=True,
+        )
+        self.assertEqual(result["parquet_footers_verified"], 1)
+        self.assertEqual(result["parquet_rows"], 3)
+        with (output / "files.sha256.tsv").open(newline="") as fh:
+            rows = list(csv.DictReader(fh, delimiter="\t"))
+        self.assertEqual(rows[0]["rows"], "3")
+        self.assertEqual(rows[0]["row_groups"], "1")
 
     def test_piece_count_for_simple_files(self):
         result = audit(self.root, piece_mib=1)
