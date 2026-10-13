@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import os
+from unittest.mock import patch
 import tempfile
 import unittest
 from pathlib import Path
@@ -159,6 +161,42 @@ class IMoPEV2PublisherTests(unittest.TestCase):
             json.loads((self.root / "dataset.json").read_text())["rows"],
             self.row_count,
         )
+
+    def test_rollback_when_second_directory_rename_fails(self):
+        before = self.snapshot()
+        staging = self.root.with_name(self.root.name + ".imope-v2-publish-stage")
+        replace = os.replace
+
+        def fail_at_activation(src, dst):
+            if Path(src) == staging and Path(dst) == self.root:
+                raise OSError("simulated publication activation failure")
+            return replace(src, dst)
+
+        with patch(
+            "bdnb_parquet.imope_v2_publish.os.replace",
+            side_effect=fail_at_activation,
+        ):
+            with self.assertRaisesRegex(OSError, "simulated publication"):
+                publish(
+                    self.plan, self.root, self.outputs,
+                    execute=True, min_free_gib=0,
+                )
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(
+            self.root.with_name(self.root.name + BACKUP_SUFFIX).exists()
+        )
+
+    def test_opt_in_prunes_only_v2_backup_after_verification(self):
+        result = publish(
+            self.plan, self.root, self.outputs,
+            execute=True, prune_backup=True, min_free_gib=0,
+        )
+        self.assertTrue(result["publication_performed"])
+        self.assertTrue(result["backup_pruned"])
+        self.assertFalse(
+            self.root.with_name(self.root.name + BACKUP_SUFFIX).exists()
+        )
+        self.assertEqual(len(list(self.root.rglob("*.parquet"))), 3)
 
     def test_wrong_stage_bytes_rejected_before_any_swap(self):
         victim = next(self.outputs.rglob("*.parquet"))
