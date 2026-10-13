@@ -891,3 +891,56 @@ publishing IMoPE: a separate audit must independently validate the
 WKB/GeoParquet coordinate extents, source-to-batch row mappings, the
 departmental manifests, and all 187 aliases before any directory
 swaps. Keep the existing five `.precompact-backup` copies.
+
+
+## IMoPE v2: independent geometry and provenance validation
+
+The 92 batches generated at `/mnt/data/imope-v2-stage-2048` must
+pass an **independent** audit before any source is removed or replaced.
+`bdnb-imope-v2-audit` repeats complete Arrow-value comparisons with
+originals, rereads each output footer and source schema, decodes all
+WKB geometries with Shapely/GEOS, recomputes real geometry bounding
+boxes and compares them to the GeoParquet metadata. It also verifies
+physical file coverage (candidate, singleton, first-published compact),
+old per-source row ranges, all existing SHA-256 aliases, and the 90
+required re-targeting proposals.
+
+The audit may be CPU- and I/O-intensive: it processes the complete
+365-million-row staging inventory, not a sample. Four spawned workers
+are supported, with at most four concurrent batches.
+
+**Full audit without any writes:**
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bdnb_parquet.imope_v2_audit \
+  --plan-dir /mnt/data/imope-v2-plan-2048 \
+  --source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet/territoire-geospatial/cadastre/batiments/imope \
+  --stage-root /mnt/data/imope-v2-stage-2048 \
+  --workers 4
+```
+
+**After successful dry validation**, to persist a complete SHA-256
+attestation in the *external stage metadata* (not inside the published
+IMoPE dataset), rerun with `--attest`. This repeats every check,
+and writes a new `_meta/imope-v2-validation.json` only when all
+92 outputs, all physical sources and all logical mappings pass. The
+command refuses to overwrite an existing attestation. It never runs
+publication, deletes backups or alters originals:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bdnb_parquet.imope_v2_audit \
+  --plan-dir /mnt/data/imope-v2-plan-2048 \
+  --source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet/territoire-geospatial/cadastre/batiments/imope \
+  --stage-root /mnt/data/imope-v2-stage-2048 \
+  --workers 4 --attest
+```
+
+A failed audit must be investigated, **not bypassed**. The 3,360
+current files remain published, and all five old
+`.precompact-backup` directories remain untouched. Even a successful
+audit is not yet permission to delete anything: the department manifest
+format, historical provenance and alias consumers need a separately
+tested publisher and a post-swap verification. The intended future
+physical layout contains 92 new compacted outputs, 27 indispensable
+singleton files, and 94 first-pass compacted outputs: those 121
+non-candidate files must **not** be deleted.
