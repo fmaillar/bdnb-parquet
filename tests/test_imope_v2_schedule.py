@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 
 from bdnb_parquet.imope_v2_plan import build_plan, write_plan
 from bdnb_parquet.imope_v2_schedule import (
-    inspect_plan, main, schedule,
+    _exclusive_staging_lock, inspect_plan, main, schedule,
 )
 
 
@@ -139,6 +139,13 @@ class ImopeV2ScheduleTests(unittest.TestCase):
         self.assertEqual(
             hashlib.sha256(file.read_bytes()).hexdigest(), corrupted_hash,
         )
+
+    def test_concurrent_stage_root_is_exclusively_locked(self):
+        self.run_batches(workers=1)
+        metadata = self.out / "_meta"
+        with _exclusive_staging_lock(metadata):
+            with self.assertRaisesRegex(RuntimeError, "Another IMoPE v2"):
+                self.run_batches(workers=1)
 
     def test_missing_output_report_requires_manual_inspection(self):
         self.run_batches(workers=1)
