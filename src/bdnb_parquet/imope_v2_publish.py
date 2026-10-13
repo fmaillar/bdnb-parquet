@@ -596,6 +596,78 @@ def publish(
         return result
 
 
+
+def prune_published_v2_backup(
+    plan_dir: Path, published_root: Path, stage_root: Path,
+) -> dict[str, Any]:
+    """Separately finalize: recheck the live replacement, then prune v2 backup.
+
+    This is intentionally unavailable before successful publication. It
+    doesn't touch the five old first-pass backups or the staging outputs.
+    """
+    plan, root, stage = (
+        p.expanduser().resolve()
+        for p in (plan_dir, published_root, stage_root)
+    )
+    backup = root.with_name(root.name + BACKUP_SUFFIX)
+    residual = root.with_name(root.name + STAGING_SUFFIX)
+    if residual.exists() or residual.is_symlink():
+        raise RuntimeError(f"Unfinished v2 publication stage: {residual}")
+    if not backup.is_dir() or backup.is_symlink():
+        raise ValueError(f"Verified v2 rollback backup missing: {backup}")
+    reject_overlapping_trees(root, plan)
+    reject_overlapping_trees(root, stage)
+    reject_overlapping_trees(plan, stage)
+    attested = _read_json(stage / "_meta" / ATTESTATION)
+    fingerprint = plan_fingerprint(plan)
+    if (attested.get("format") != "imope-v2-validation-v1"
+        or attested.get("source_root") != str(root)
+        or attested.get("staging_root") != str(stage)
+        or attested.get("plan_sha256") != fingerprint):
+        raise ValueError("Original independent audit attestation differs")
+    data = _read_json(root / "_COMPACTION_V2.json")
+    if (data.get("format") != "imope-v2-publication-v1"
+        or data.get("plan_sha256") != fingerprint
+        or data.get("attestation_sha256")
+        != sha256(stage / "_meta" / ATTESTATION)
+        or data.get("input_physical_files") != 3360
+        or data.get("published_files") != 213
+        or data.get("new_compacts") != attested.get("validated_batches")
+        or data.get("aliases_retargeted") !=
+        attested["lineage"]["aliases_requiring_retarget"]):
+        raise ValueError("Live v2 publication metadata doesn't match attestation")
+    manifest = _read_json(root / "manifest.json")
+    verified = {
+        entry["output"]: entry
+        for entry in attested["outputs"]
+    }
+    if len(verified) != len(attested["outputs"]):
+        raise ValueError("Repeated attested output in cleanup")
+    with _exclusive_staging_lock(stage / "_meta"):
+        _validate_published(root, {
+            "manifest": manifest,
+            "verified_outputs": verified,
+        }, data)
+        old_manifest, old_dataset, old_index = _metadata_preflight(backup, set())
+        if (sum(x["files"] for x in old_manifest) != data["input_physical_files"]
+            or old_dataset["rows"] != data["verified_physical_rows"]
+            or len(old_index["deduplicated_aliases"]) != data["alias_count"]):
+            raise ValueError("Old v2 rollback backup doesn't match publication")
+        prune_validated_backup(backup)
+    result = {
+        "mode": "finalize-v2-publication",
+        "publication_validated": True,
+        "physical_files": data["published_files"],
+        "physical_rows": data["verified_physical_rows"],
+        "backup_pruned": True,
+        "backup_path": str(backup),
+        "first_pass_backups_untouched": True,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    return result
+
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="Publish independently attested IMoPE v2 after safe staging"
@@ -606,9 +678,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--min-free-gib", type=int, default=20)
     p.add_argument("--execute", action="store_true")
     p.add_argument("--prune-backup", action="store_true",
-                   help="permanently remove old v2 publication only after post-swap checks")
+                   help="prune old v2 dataset after checked swap in the same run")
+    p.add_argument("--prune-backup-only", action="store_true",
+                   help="separate post-publication revalidation then prune v2 backup")
     args = p.parse_args(argv)
+    if args.prune_backup_only and (args.execute or args.prune_backup):
+        p.error("--prune-backup-only cannot be combined with --execute/--prune-backup")
     try:
+        if args.prune_backup_only:
+            prune_published_v2_backup(args.plan_dir, args.source_root, args.stage_root)
+            return 0
         publish(
             args.plan_dir, args.source_root, args.stage_root,
             execute=args.execute, prune_backup=args.prune_backup,
