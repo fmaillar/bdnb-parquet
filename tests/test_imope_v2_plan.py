@@ -195,6 +195,69 @@ class ImopeV2PlanTests(unittest.TestCase):
         )
         self.assertEqual(len(paths), 5)
 
+    def test_existing_imope_aliases_have_proposed_retarget_offsets(self):
+        self.make_file("Dpt01", rows=2, bbox=[0, 0, 1, 1])
+        self.make_file("Dpt02", rows=3, bbox=[1, 1, 2, 2])
+        self.make_file("Dpt03", name="compact-original.parquet", rows=7)
+        index = {
+            "dataset": "imope",
+            "deduplicated_aliases": [
+                {
+                    "original": "Dpt04/old.parquet",
+                    "published_scope": "imope",
+                    "published": "Dpt02/adresse.parquet",
+                    "first_row": 1,
+                    "rows": 2,
+                    "sha256": "sha-a",
+                },
+                {
+                    "original": "Dpt05/old.parquet",
+                    "published_scope": "imope",
+                    "published": "Dpt03/compact-original.parquet",
+                    "first_row": 2,
+                    "rows": 1,
+                    "sha256": "sha-b",
+                },
+                {
+                    "original": "Dpt06/old.parquet",
+                    "published_scope": "release",
+                    "published": "parquet/another/table.parquet",
+                    "first_row": 0,
+                    "rows": 1,
+                    "sha256": "sha-c",
+                },
+            ],
+        }
+        (self.root / "_COMPACTION_SOURCES.json").write_text(json.dumps(index))
+        plan = build_plan(self.root)
+        summary = plan["summary"]
+        self.assertTrue(summary["existing_source_index_present"])
+        self.assertEqual(summary["existing_logical_aliases"], 3)
+        self.assertEqual(summary["existing_aliases_requiring_retarget"], 1)
+        self.assertEqual(summary["existing_release_scoped_aliases"], 1)
+        changed = plan["pending_alias_rewrites"]
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0]["original_alias"], "Dpt04/old.parquet")
+        self.assertEqual(changed[0]["proposed_first_row"], 3)
+        self.assertEqual(changed[0]["rows"], 2)
+        self.assertEqual(changed[0]["action"], "future-index-migration-required-NOT-executed")
+
+    def test_invalid_alias_reference_blocks_plan(self):
+        self.make_file("Dpt01")
+        self.make_file("Dpt02")
+        (self.root / "_COMPACTION_SOURCES.json").write_text(json.dumps({
+            "dataset": "imope",
+            "deduplicated_aliases": [{
+                "original": "bad",
+                "published_scope": "imope",
+                "published": "../escape.parquet",
+                "first_row": 0,
+                "rows": 1,
+            }],
+        }))
+        with self.assertRaisesRegex(ValueError, "Unsafe IMoPE alias physical path"):
+            build_plan(self.root)
+
     def test_external_manifest_export_and_no_clobber(self):
         self.make_file("Dpt01", rows=2, bbox=[0, 0, 1, 1])
         self.make_file("Dpt02", rows=3, bbox=[1, 1, 2, 2])
