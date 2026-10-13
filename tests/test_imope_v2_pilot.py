@@ -114,9 +114,11 @@ class TestImopeV2Pilot(unittest.TestCase):
         self.assertEqual(before, self.bytes_snapshot())
 
     def test_requires_new_external_root(self):
+        existing = self.base / "existing-output"
+        existing.mkdir()
         with self.assertRaisesRegex(FileExistsError, "NEW directory"):
             pilot(
-                self.plan, self.root, output_root=self.root.parent,
+                self.plan, self.root, output_root=existing,
                 execute=True,
             )
         with self.assertRaisesRegex(ValueError, "must not overlap"):
