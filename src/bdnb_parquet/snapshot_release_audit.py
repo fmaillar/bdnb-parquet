@@ -82,8 +82,11 @@ def inventory(root: Path) -> tuple[list[SnapshotFile], list[str]]:
     """List every payload file once; reject symlinks and unusual FS entries."""
     records: list[SnapshotFile] = []
     excluded: list[str] = []
+    def fail_walk(error: OSError) -> None:
+        raise error
+
     for directory, subdirs, filenames in os.walk(
-        root, topdown=True, followlinks=False,
+        root, topdown=True, followlinks=False, onerror=fail_walk,
     ):
         base = Path(directory)
         for name in sorted(subdirs[:]):
@@ -113,6 +116,8 @@ def inventory(root: Path) -> tuple[list[SnapshotFile], list[str]]:
                 info.st_mtime_ns,
             ))
     records.sort(key=lambda r: r.relative.encode("utf-8"))
+    if not records:
+        raise ValueError("Snapshot payload has no regular files")
     if len({r.relative for r in records}) != len(records):
         raise ValueError("Duplicate snapshot relative paths")
     return records, sorted(excluded)
