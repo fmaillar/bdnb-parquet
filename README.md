@@ -944,3 +944,90 @@ tested publisher and a post-swap verification. The intended future
 physical layout contains 92 new compacted outputs, 27 indispensable
 singleton files, and 94 first-pass compacted outputs: those 121
 non-candidate files must **not** be deleted.
+
+
+## IMoPE v2: attested publication and redundant-source cleanup
+
+After the **independent geometry and Arrow audit passed for all 92
+batches** (3,239 sources, 365,270,873 verified rows, 64 WKB GeoParquet
+batches and all 187 aliases, including 90 to retarget), the new
+`bdnb-imope-v2-publish` publishes **only the IMoPE dataset**. The
+expected layout has **213** physical Parquet files: 92 newly grouped,
+94 preserved compact files from the first publication, and 27 preserved
+singleton files. All source data is preserved through *logical* department
+row ranges and the versioned source index.
+
+This command does **not** modify other dataset roots, torrent data,
+external corpus release hashes or the five first-pass
+`.precompact-backup` directories. It does not automatically seed a
+new torrent. The legacy IMoPE department folders still hold
+`_SUCCESS.json` and any indispensable old files; they are not all
+deleted because department-level metadata must stay accessible. No
+redundant old Parquet remains in the replacement dataset.
+
+It first verifies the immutable plan and independent attestation
+fingerprints, hashes each staged output Parquet against the 92 original
+attested SHA-256 values, **recompares all source Arrow values with the
+validated outputs immediately before any swap**, and confirms the departmental Parquet
+manifest and all 187 aliases, and refuses any extra files.
+
+**Dry-run / preflight (default, no changes to published files):**
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bdnb_parquet.imope_v2_publish \
+  --plan-dir /mnt/data/imope-v2-plan-2048 \
+  --source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet/territoire-geospatial/cadastre/batiments/imope \
+  --stage-root /mnt/data/imope-v2-stage-2048
+```
+
+**Publish the audited replacement with a distinct v2 rollback backup:**
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bdnb_parquet.imope_v2_publish \
+  --plan-dir /mnt/data/imope-v2-plan-2048 \
+  --source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet/territoire-geospatial/cadastre/batiments/imope \
+  --stage-root /mnt/data/imope-v2-stage-2048 \
+  --execute
+```
+
+The publisher builds a complete sibling replacement tree through
+hardlinks or verified byte-for-byte copies; it removes only the planned
+3,239 source paths *inside that replacement*, links the 92 attested
+outputs, constructs `tables/<table>/compact-v2-*.parquet`, rebuilds
+departmental `manifest.json` and `_SUCCESS.json` files, migrates
+90 alias row offsets, and extends `_COMPACTION_SOURCES.json` with
+`v2_sources` **without discarding the 194 historical first-pass
+source records**. It independently checks all Parquet file counts,
+rows, source ranges and aliases *before* swapping the IMoPE directory.
+After the swap, it rechecks every new output SHA-256 plus all metadata
+references. An ordinary post-swap error attempts to restore the original
+directory; a power failure may require manual recovery.
+
+**Separate, preferred cleanup after inspecting the published output:**
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bdnb_parquet.imope_v2_publish \
+  --plan-dir /mnt/data/imope-v2-plan-2048 \
+  --source-root /mnt/data/datasets/france-open-data-parquet-2026-10-10/parquet/territoire-geospatial/cadastre/batiments/imope \
+  --stage-root /mnt/data/imope-v2-stage-2048 \
+  --prune-backup-only
+```
+
+This separate command **revalidates all newly published files by their
+attested SHA-256 and row-index references, verifies old backup metadata,
+then removes only the distinct v2 rollback backup**. It does not require
+rerunning the staging operation and cannot be run before publication.
+
+The original pre-v2 published directory is retained by default at the
+sibling path `imope.imope-v2-prepublish-backup`. This backup is distinct
+from the five previous `.precompact-backup` directories and must not
+be mistaken for them. The one-pass option `--execute --prune-backup`
+irreversibly deletes that v2 backup **only after the new published
+dataset has passed its post-swap checks**. Use only when willing to
+forfeit the immediate v2 rollback. There is deliberately no automatic
+pruning of older first-pass backups.
+
+Any existing v2 replacement stage or v2 backup blocks another
+publication attempt, avoiding unsafe overwrites. For old torrents and
+release metadata, regenerate the global manifests and torrent *after*
+this publication has been audited and the release tree is stable.
