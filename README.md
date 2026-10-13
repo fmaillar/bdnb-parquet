@@ -1081,13 +1081,15 @@ any of its files:
 PYTHONPATH=src .venv/bin/python -m bdnb_parquet.snapshot_release_audit \
   --root "$RELEASE" \
   --output-dir /mnt/data/snapshot-release-audit-2026-10-13 \
-  --write-manifest
+  --write-manifest --verify-parquet
 ```
 
 The destination must **not already exist**. This reads the complete
 payload once and produces `files.sha256.tsv` with stable, sorted,
 relative filenames and a companion `summary.json` including the
-SHA-256 of the manifest itself. The command checks file identities,
+SHA-256 of the manifest itself. With `--verify-parquet`, it also
+checks every Parquet footer and records row/row-group counts. The
+command checks file identities,
 sizes and mtimes before and after hashing and re-enumerates the
 snapshot before declaring completion. An interrupted run must be
 inspected rather than blindly reused. All writes are inside the new
